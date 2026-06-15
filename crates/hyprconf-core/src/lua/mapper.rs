@@ -502,7 +502,14 @@ fn luaval_to_value(value_type: &ValueType, leaf: &LuaVal) -> Result<Value, Strin
             .map_err(|e| e.to_string()),
         ValueType::String => Ok(Value::String(render_scalar(leaf))),
         ValueType::Enum(variants) => {
-            let s = expect_str(leaf)?;
+            // Accept both string literals (`layout = "dwindle"`) and numeric
+            // literals (`follow_mouse = 1`), since Hyprland's integer "mode"
+            // options are modelled as enums whose variant names are integers.
+            let s = match leaf {
+                LuaVal::Str(s) => s.clone(),
+                LuaVal::Num(n) => n.clone(),
+                other => return Err(format!("expected a string or number, found {other:?}")),
+            };
             if variants.iter().any(|v| v.name == s) {
                 Ok(Value::Enum(s))
             } else {

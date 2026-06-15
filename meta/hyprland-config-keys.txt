@@ -88,6 +88,8 @@ decoration.glow.enabled
 decoration.glow.range
 decoration.glow.render_power
 decoration.inactive_opacity
+decoration.motion_blur.enabled
+decoration.motion_blur.samples
 decoration.rounding
 decoration.rounding_power
 decoration.screen_shader
@@ -236,6 +238,10 @@ input.tablet.region_position
 input.tablet.region_size
 input.tablet.relative_input
 input.tablet.transform
+input.tablettool.eraser_button_mode
+input.tablettool.eraser_button_override
+input.tablettool.pressure_range_max
+input.tablettool.pressure_range_min
 input.touchdevice.enabled
 input.touchdevice.output
 input.touchdevice.transform
@@ -260,6 +266,7 @@ master.always_keep_position
 master.center_ignores_reserved
 master.center_master_fallback
 master.drop_at_cursor
+master.focus_master_on_close
 master.mfact
 master.new_on_active
 master.new_on_top

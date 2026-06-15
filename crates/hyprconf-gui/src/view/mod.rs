@@ -650,23 +650,105 @@ fn string_editor(opt: &OptionSpec, loaded: &Loaded) -> Element<'static, Message>
     text_field(&draft, &path, Slot::Main, false, Length::Fill, "value")
 }
 
+/// A selectable enum variant: the dropdown shows a human-friendly [`label`]
+/// while edits round-trip the literal [`value`] written to the config.
+///
+/// Equality is by `value` only so the `pick_list` highlights the active choice
+/// regardless of how its label is formatted.
+#[derive(Clone)]
+struct EnumChoice {
+    value: String,
+    label: String,
+}
+
+impl PartialEq for EnumChoice {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
+impl std::fmt::Display for EnumChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
+/// Build a dropdown label for an enum variant. Numeric "mode" literals (and the
+/// empty/unset literal) are cryptic on their own, so their meaning is shown
+/// inline (e.g. `1  ·  Follow`); self-describing textual variants (e.g.
+/// `dwindle`) are shown as-is, with the full description in the helper line.
+fn enum_choice_label(name: &str, description: Option<&str>) -> String {
+    let shown = if name.is_empty() { "(unset)" } else { name };
+    match description {
+        Some(desc) if name.is_empty() || name.parse::<f64>().is_ok() => {
+            format!("{shown}  ·  {}", desc_headline(desc))
+        }
+        _ => shown.to_string(),
+    }
+}
+
+/// The leading clause of a variant description, for compact dropdown entries.
+fn desc_headline(description: &str) -> &str {
+    description
+        .split([':', '.', '('])
+        .next()
+        .unwrap_or(description)
+        .trim()
+}
+
 fn enum_editor(opt: &OptionSpec, loaded: &Loaded) -> Element<'static, Message> {
     let path = opt.path.clone();
-    let variants: Vec<String> = opt
-        .enum_variants()
-        .map(|vs| vs.iter().map(|v| v.name.clone()).collect())
-        .unwrap_or_default();
+    let variants = opt.enum_variants().unwrap_or_default();
+
+    // The literal currently in effect (an explicit selection, or the default).
+    // A value Hyprland accepts but we don't enumerate (e.g. a plugin-provided
+    // layout) arrives as a `String`; keep it visible and selectable.
     let current = match loaded.value_for(opt) {
-        Value::Enum(name) => Some(name),
-        _ => None,
+        Value::Enum(name) => name,
+        Value::String(s) => s,
+        other => value_to_conf(&other),
     };
-    pick_list(variants, current, move |v| {
-        Message::Edit(EditAction::SetEnum(path.clone(), v))
+
+    let mut choices: Vec<EnumChoice> = variants
+        .iter()
+        .map(|v| EnumChoice {
+            value: v.name.clone(),
+            label: enum_choice_label(&v.name, v.description.as_deref()),
+        })
+        .collect();
+    if !choices.iter().any(|c| c.value == current) {
+        let label = if current.is_empty() {
+            "(unset)".to_string()
+        } else {
+            current.clone()
+        };
+        choices.insert(
+            0,
+            EnumChoice {
+                value: current.clone(),
+                label,
+            },
+        );
+    }
+
+    let selected = choices.iter().find(|c| c.value == current).cloned();
+    let selected_desc = variants
+        .iter()
+        .find(|v| v.name == current)
+        .and_then(|v| v.description.clone());
+
+    let picker = pick_list(choices, selected, move |c: EnumChoice| {
+        Message::Edit(EditAction::SetEnum(path.clone(), c.value))
     })
     .padding([6, 10])
     .text_size(14)
-    .width(Length::Fixed(240.0))
-    .into()
+    .width(Length::Fixed(300.0));
+
+    let mut col = column![picker].spacing(6);
+    if let Some(desc) = selected_desc {
+        col = col.push(text(desc).size(11).style(muted));
+    }
+    col.into()
 }
 
 fn color_editor(opt: &OptionSpec, loaded: &Loaded) -> Element<'static, Message> {
@@ -1917,6 +1999,45 @@ fn layer_rule_row(i: usize, lr: &LayerRule, count: usize) -> Element<'static, Me
     )
 }
 
+/// A labelled dropdown for a fixed-choice collection field (e.g. a monitor
+/// transform). Always offers an explicit "(unset)" entry and keeps any unknown
+/// current value selectable, mirroring [`enum_editor`].
+fn coll_choice(
+    label: &'static str,
+    current: String,
+    variants: &[(&str, &str)],
+    width: f32,
+    on_select: impl Fn(String) -> Message + 'static,
+) -> Element<'static, Message> {
+    let mut choices = vec![EnumChoice {
+        value: String::new(),
+        label: "(unset)".to_string(),
+    }];
+    for (value, desc) in variants {
+        choices.push(EnumChoice {
+            value: (*value).to_string(),
+            label: format!("{value}  ·  {desc}"),
+        });
+    }
+    if !choices.iter().any(|c| c.value == current) {
+        choices.push(EnumChoice {
+            value: current.clone(),
+            label: current.clone(),
+        });
+    }
+    let selected = choices.iter().find(|c| c.value == current).cloned();
+    column![
+        text(label).size(11).style(muted),
+        pick_list(choices, selected, move |c: EnumChoice| on_select(c.value))
+            .padding([6, 8])
+            .text_size(14)
+            .width(Length::Fixed(width)),
+    ]
+    .spacing(2)
+    .width(Length::Fixed(width))
+    .into()
+}
+
 fn monitor_row(i: usize, m: &MonitorRule, count: usize) -> Element<'static, Message> {
     let field = |label: &'static str,
                  value: String,
@@ -1955,15 +2076,32 @@ fn monitor_row(i: usize, m: &MonitorRule, count: usize) -> Element<'static, Mess
             .width(Length::FillPortion(2)),
             field("scale", m.scale.clone(), "1 / auto", MonitorEdit::Scale)
                 .width(Length::Fixed(120.0)),
-            field(
+            coll_choice(
                 "transform",
                 extra_field(&m.extra, "transform"),
-                "0-7",
-                MonitorEdit::Transform
-            )
-            .width(Length::Fixed(90.0)),
-            field("vrr", extra_field(&m.extra, "vrr"), "0-2", MonitorEdit::Vrr)
-                .width(Length::Fixed(90.0)),
+                &[
+                    ("0", "Normal"),
+                    ("1", "90°"),
+                    ("2", "180°"),
+                    ("3", "270°"),
+                    ("4", "Flipped"),
+                    ("5", "Flipped + 90°"),
+                    ("6", "Flipped + 180°"),
+                    ("7", "Flipped + 270°"),
+                ],
+                170.0,
+                move |s| Message::CollectionEdit(CollectionAction::Monitor(
+                    i,
+                    MonitorEdit::Transform(s)
+                )),
+            ),
+            coll_choice(
+                "vrr",
+                extra_field(&m.extra, "vrr"),
+                &[("0", "Off"), ("1", "On"), ("2", "Fullscreen only")],
+                160.0,
+                move |s| Message::CollectionEdit(CollectionAction::Monitor(i, MonitorEdit::Vrr(s))),
+            ),
             field(
                 "mirror",
                 extra_field(&m.extra, "mirror"),
@@ -2380,6 +2518,12 @@ fn section_icon(id: &str) -> &'static str {
         "cursor" => "🖱",
         "render" => "🖼",
         "debug" => "🐞",
+        "layout" => "🧱",
+        "scrolling" => "📜",
+        "opengl" => "🧊",
+        "ecosystem" => "🌱",
+        "experimental" => "🧪",
+        "quirks" => "🔧",
         _ => "•",
     }
 }

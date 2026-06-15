@@ -618,4 +618,72 @@ mod tests {
             );
         }
     }
+
+    /// Choice-typed options must expose their full list of variants (so the GUI
+    /// renders dropdowns, not free text). Variant sets are pinned against the
+    /// Hyprland 0.55.2 `src/config/values/ConfigValues.cpp` option data.
+    #[test]
+    fn choice_options_are_enums_with_expected_variants() {
+        let schema = Schema::load();
+        let variants = |path: &str| -> Vec<String> {
+            schema
+                .option(path)
+                .unwrap_or_else(|| panic!("missing option `{path}`"))
+                .enum_variants()
+                .unwrap_or_else(|| panic!("`{path}` is not an enum"))
+                .iter()
+                .map(|v| v.name.clone())
+                .collect()
+        };
+
+        // Integer "mode" options expose their integer literals as variants.
+        assert_eq!(
+            variants("input:follow_mouse"),
+            ["0", "1", "2", "3"].map(str::to_string)
+        );
+        assert_eq!(
+            variants("misc:vrr"),
+            ["0", "1", "2", "3"].map(str::to_string)
+        );
+        assert_eq!(
+            variants("misc:force_default_wallpaper"),
+            ["-1", "0", "1", "2"].map(str::to_string)
+        );
+        assert_eq!(
+            variants("dwindle:force_split"),
+            ["0", "1", "2"].map(str::to_string)
+        );
+        assert_eq!(
+            variants("cursor:no_hardware_cursors"),
+            ["0", "1", "2"].map(str::to_string)
+        );
+        assert_eq!(
+            variants("general:resize_corner"),
+            ["0", "1", "2", "3", "4"].map(str::to_string)
+        );
+
+        // String-choice options expose their textual variants (incl. unset "").
+        assert_eq!(
+            variants("input:accel_profile"),
+            ["", "adaptive", "flat", "custom"].map(str::to_string)
+        );
+        assert_eq!(
+            variants("input:scroll_method"),
+            ["", "2fg", "edge", "on_button_down", "no_scroll"].map(str::to_string)
+        );
+
+        // Every enum variant carries a description (the "meaning" of the value),
+        // and every enum's default is one of its own variants.
+        for opt in schema.options() {
+            if let ValueType::Enum(vs) = &opt.value_type {
+                assert!(
+                    vs.iter().all(|v| v.description.is_some()),
+                    "enum `{}` has a variant without a description",
+                    opt.path
+                );
+                opt.validate_default()
+                    .unwrap_or_else(|e| panic!("enum default invalid for `{}`: {e}", opt.path));
+            }
+        }
+    }
 }

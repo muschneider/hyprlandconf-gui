@@ -253,6 +253,9 @@ mod tests {
         assert_eq!(value_to_conf(&Value::Float(1.0)), "1");
         assert_eq!(value_to_conf(&Value::String("us".into())), "us");
         assert_eq!(value_to_conf(&Value::Enum("dwindle".into())), "dwindle");
+        // Integer "mode" enums serialize verbatim as their numeric literal.
+        assert_eq!(value_to_conf(&Value::Enum("2".into())), "2");
+        assert_eq!(value_to_conf(&Value::Enum("-1".into())), "-1");
         assert_eq!(
             value_to_conf(&Value::Color(Color::rgba(0x1a, 0x2b, 0x3c, 0xff))),
             "rgba(1a2b3cff)"

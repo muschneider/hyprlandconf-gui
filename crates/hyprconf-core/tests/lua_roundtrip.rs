@@ -179,3 +179,70 @@ fn missing_lua_require_is_a_typed_error() {
         Err(hyprconf_core::LuaError::NotFound { .. })
     ));
 }
+
+/// Hyprland integer "mode" options (e.g. `follow_mouse`, `vrr`) are modelled as
+/// enums whose variant literals are integers. They must emit as bare Lua
+/// numbers (not quoted strings) and as plain integers in `.conf`, and parse back
+/// to the identical enum value from either format. Textual enums (`layout`)
+/// stay quoted in Lua.
+#[test]
+fn numeric_mode_enums_round_trip_as_numbers() {
+    let schema = Schema::load();
+
+    let mut config = Config::empty();
+    for (path, variant) in [
+        ("input:follow_mouse", "2"),
+        ("misc:vrr", "3"),
+        ("misc:force_default_wallpaper", "-1"),
+        ("cursor:no_hardware_cursors", "1"),
+        ("general:layout", "master"),
+    ] {
+        config
+            .options
+            .insert(path.into(), Tracked::new(Value::Enum(variant.into())));
+    }
+
+    // --- Lua: numeric variants are bare numbers; textual ones stay quoted. ---
+    let lua_text = LuaSerializer::serialize(&config);
+    assert!(lua_text.contains("follow_mouse = 2"), "{lua_text}");
+    assert!(lua_text.contains("vrr = 3"), "{lua_text}");
+    assert!(
+        lua_text.contains("force_default_wallpaper = -1"),
+        "{lua_text}"
+    );
+    assert!(lua_text.contains("no_hardware_cursors = 1"), "{lua_text}");
+    assert!(lua_text.contains("layout = \"master\""), "{lua_text}");
+    assert!(
+        !lua_text.contains("follow_mouse = \"2\""),
+        "numeric mode enums must not be quoted: {lua_text}"
+    );
+
+    let lua_doc = LuaParser::parse_str(&lua_text, None).unwrap();
+    let (from_lua, warnings) = lua::document_to_config(&lua_doc, &schema);
+    assert!(warnings.is_empty(), "unexpected lua warnings: {warnings:?}");
+    assert_eq!(
+        from_lua.get("input:follow_mouse"),
+        Some(&Value::Enum("2".into()))
+    );
+    assert_eq!(from_lua.get("misc:vrr"), Some(&Value::Enum("3".into())));
+    assert_eq!(
+        from_lua.get("misc:force_default_wallpaper"),
+        Some(&Value::Enum("-1".into()))
+    );
+    assert_eq!(
+        from_lua.get("general:layout"),
+        Some(&Value::Enum("master".into()))
+    );
+
+    // --- Conf: numeric variants are emitted and parsed verbatim. ---
+    let conf_text = conf::config_to_conf(&config);
+    assert!(conf_text.contains("input:follow_mouse = 2"), "{conf_text}");
+    assert!(conf_text.contains("misc:vrr = 3"), "{conf_text}");
+    let conf_doc = conf::ConfParser::parse_str(&conf_text, None);
+    let (from_conf, _) = conf::document_to_config(&conf_doc, &schema);
+    assert_eq!(from_conf.get("misc:vrr"), Some(&Value::Enum("3".into())));
+    assert_eq!(
+        from_conf.get("cursor:no_hardware_cursors"),
+        Some(&Value::Enum("1".into()))
+    );
+}

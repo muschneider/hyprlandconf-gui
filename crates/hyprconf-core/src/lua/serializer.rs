@@ -145,6 +145,11 @@ pub fn value_to_lua(value: &Value) -> String {
         Value::Color(c) => format!("\"{}\"", c.to_rgba_string()),
         Value::Gradient(g) => format!("\"{}\"", escape(&g.to_hyprland_string())),
         Value::String(s) => format!("\"{}\"", escape(s)),
+        // Enum variants whose literal is numeric (Hyprland integer "mode"
+        // options like `follow_mouse = 1` or `force_default_wallpaper = -1`)
+        // must be emitted as bare Lua numbers; textual variants (e.g.
+        // `layout = "dwindle"`) stay quoted strings.
+        Value::Enum(name) if is_lua_number(name) => name.clone(),
         Value::Enum(name) => format!("\"{}\"", escape(name)),
         Value::Vec2(v) => format!("\"{}\"", v.to_hyprland_string()),
     }
@@ -342,6 +347,17 @@ fn num(value: f64) -> String {
     }
 }
 
+/// Whether an enum variant literal is a plain number (so it should be emitted as
+/// a bare Lua number rather than a quoted string). Used for Hyprland's integer
+/// "mode" options that are modelled as enums (e.g. `follow_mouse`, `vrr`). Only
+/// finite integers/decimals count; the empty string and tokens like `2fg` do not.
+fn is_lua_number(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok_and(f64::is_finite)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,10 +370,28 @@ mod tests {
         assert_eq!(value_to_lua(&Value::Float(0.5)), "0.5");
         assert_eq!(value_to_lua(&Value::Float(1.0)), "1");
         assert_eq!(value_to_lua(&Value::Enum("dwindle".into())), "\"dwindle\"");
+        // Numeric "mode" enum literals emit as bare Lua numbers; textual,
+        // empty, and digit-prefixed-but-non-numeric variants stay quoted.
+        assert_eq!(value_to_lua(&Value::Enum("1".into())), "1");
+        assert_eq!(value_to_lua(&Value::Enum("-1".into())), "-1");
+        assert_eq!(value_to_lua(&Value::Enum(String::new())), "\"\"");
+        assert_eq!(value_to_lua(&Value::Enum("2fg".into())), "\"2fg\"");
         assert_eq!(
             value_to_lua(&Value::Color(Color::rgb(255, 0, 0))),
             "\"rgba(ff0000ff)\""
         );
+    }
+
+    #[test]
+    fn is_lua_number_distinguishes_numeric_literals() {
+        assert!(is_lua_number("0"));
+        assert!(is_lua_number("-1"));
+        assert!(is_lua_number("3"));
+        assert!(is_lua_number("0.5"));
+        assert!(!is_lua_number(""));
+        assert!(!is_lua_number("auto"));
+        assert!(!is_lua_number("2fg"));
+        assert!(!is_lua_number("inf"));
     }
 
     #[test]

@@ -10,7 +10,7 @@
 
 use full_moon::ast::{
     Call, Expression, Field, FunctionArgs, FunctionCall, Index, Prefix, Stmt, Suffix,
-    TableConstructor,
+    TableConstructor, UnOp,
 };
 use full_moon::tokenizer::{TokenReference, TokenType};
 
@@ -70,6 +70,18 @@ pub(crate) fn expr_to_luaval(expr: &Expression) -> LuaVal {
         },
         Expression::TableConstructor(tc) => table_to_luaval(tc),
         Expression::Parentheses { expression, .. } => expr_to_luaval(expression),
+        // Lua has no negative number *literals*: `-1` is unary minus applied to
+        // the literal `1`. Fold `-<number>` back into a numeric value so signed
+        // integer/float options — and numeric "mode" enums like
+        // `force_default_wallpaper = -1` — round-trip. Other unary ops (`not`,
+        // `#`) remain dynamic.
+        Expression::UnaryOperator {
+            unop: UnOp::Minus(_),
+            expression,
+        } => match expr_to_luaval(expression) {
+            LuaVal::Num(n) => LuaVal::Num(format!("-{n}")),
+            _ => LuaVal::Other,
+        },
         _ => LuaVal::Other,
     }
 }
@@ -244,6 +256,22 @@ mod tests {
         assert_eq!(fields[1].key.as_deref(), Some("b.c"));
         assert_eq!(fields[1].value, LuaVal::Bool(true));
         assert_eq!(fields[2].key, None);
+    }
+
+    #[test]
+    fn negative_numbers_fold_into_numeric_values() {
+        // `-1` is unary-minus over `1` in Lua; it must lower to a numeric value
+        // (not `Other`) so signed options and numeric "mode" enums round-trip.
+        let fc = first_stmt_call("hl.config({ misc = { force_default_wallpaper = -1 } })\n");
+        let (_callee, args) = callee_path(&fc).unwrap();
+        let LuaVal::Table(outer) = &args[0] else {
+            panic!("expected table");
+        };
+        let LuaVal::Table(misc) = &outer[0].value else {
+            panic!("expected nested table");
+        };
+        assert_eq!(misc[0].key.as_deref(), Some("force_default_wallpaper"));
+        assert_eq!(misc[0].value, LuaVal::Num("-1".into()));
     }
 
     #[test]
