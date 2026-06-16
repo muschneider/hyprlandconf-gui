@@ -763,51 +763,20 @@ fn color_editor(opt: &OptionSpec, loaded: &Loaded) -> Element<'static, Message> 
         .unwrap_or_else(|| color.to_rgba_string());
     let hex_err = loaded.field_error(&path, Slot::Hex).is_some();
 
-    let top = row![
+    // Edited like every other color option (gradient stops, border colors):
+    // a swatch + hex field + "pick" button that opens the visual picker. The
+    // R/G/B/A sliders live in that popup, not inline here.
+    row![
         swatch_button(color, path.clone()),
         text_field(
             &hex_draft,
             &path,
             Slot::Hex,
             hex_err,
-            Length::Fixed(190.0),
+            Length::Fill,
             "rgba(rrggbbaa)"
         ),
         pick_button(path.clone()),
-    ]
-    .spacing(10)
-    .align_y(Alignment::Center);
-
-    let sliders = column![
-        channel_slider(&path, ColorChannel::R, "R", color.r),
-        channel_slider(&path, ColorChannel::G, "G", color.g),
-        channel_slider(&path, ColorChannel::B, "B", color.b),
-        channel_slider(&path, ColorChannel::A, "A", color.a),
-    ]
-    .spacing(4);
-
-    column![top, sliders].spacing(10).into()
-}
-
-fn channel_slider(
-    path: &str,
-    channel: ColorChannel,
-    label: &'static str,
-    value: u8,
-) -> Element<'static, Message> {
-    let p = path.to_string();
-    row![
-        text(label).size(12).style(muted).width(Length::Fixed(14.0)),
-        slider(0.0..=255.0, value as f64, move |v| {
-            Message::Edit(EditAction::SetColorChannel(
-                p.clone(),
-                channel,
-                v.round() as u8,
-            ))
-        })
-        .step(1.0)
-        .width(Length::Fill),
-        text(value.to_string()).size(12).width(Length::Fixed(32.0)),
     ]
     .spacing(10)
     .align_y(Alignment::Center)

@@ -75,8 +75,6 @@ pub enum EditAction {
     SetIntSlider(String, i64),
     /// Move a float slider.
     SetFloatSlider(String, f64),
-    /// Move a color channel slider.
-    SetColorChannel(String, ColorChannel, u8),
     /// Set a whole color at once (from the visual picker's 2D area / hue strip).
     SetColor(String, Color),
     /// Set one gradient stop's color (from the visual picker).
@@ -161,9 +159,6 @@ impl Loaded {
             EditAction::SetFloatSlider(path, x) => {
                 self.commit(&path, Value::Float(x));
                 self.set_draft(&path, Slot::Main, fmt_num(x));
-            }
-            EditAction::SetColorChannel(path, ch, v) => {
-                self.set_color_channel(&path, ch, v, schema)
             }
             EditAction::SetColor(path, color) => {
                 self.commit(&path, Value::Color(color));
@@ -335,18 +330,6 @@ impl Loaded {
         );
     }
 
-    fn set_color_channel(&mut self, path: &str, ch: ColorChannel, v: u8, schema: &Schema) {
-        let mut color = self.current_color(path, schema);
-        match ch {
-            ColorChannel::R => color.r = v,
-            ColorChannel::G => color.g = v,
-            ColorChannel::B => color.b = v,
-            ColorChannel::A => color.a = v,
-        }
-        self.commit(path, Value::Color(color));
-        self.set_draft(path, Slot::Hex, color.to_rgba_string());
-    }
-
     /// Set one gradient stop's color outright (from the visual picker), syncing
     /// that stop's hex draft.
     fn set_stop_color(&mut self, path: &str, index: usize, color: Color, schema: &Schema) {
@@ -377,16 +360,6 @@ impl Loaded {
         self.errors
             .retain(|id, _| id.path != path || !matches!(id.slot, Slot::Stop(_)));
         self.commit(path, Value::Gradient(g));
-    }
-
-    fn current_color(&self, path: &str, schema: &Schema) -> Color {
-        match self.config.get(path) {
-            Some(Value::Color(c)) => *c,
-            _ => match schema.option(path).map(|o| &o.default) {
-                Some(Value::Color(c)) => *c,
-                _ => Color::rgba(0, 0, 0, 0xff),
-            },
-        }
     }
 
     fn current_vec2(&self, path: &str, schema: &Schema) -> Vec2 {
@@ -1132,7 +1105,6 @@ impl EditAction {
             EditAction::SetIntSlider(path, _) | EditAction::SetFloatSlider(path, _) => {
                 Some(format!("slider:{path}"))
             }
-            EditAction::SetColorChannel(path, ch, _) => Some(format!("color:{path}:{ch:?}")),
             EditAction::SetColor(path, _) => Some(format!("colorpick:{path}")),
             EditAction::SetStopColor(path, index, _) => Some(format!("colorpick:{path}:{index}")),
             _ => None,
@@ -1147,7 +1119,6 @@ impl EditAction {
             | EditAction::SetEnum(p, _)
             | EditAction::SetIntSlider(p, _)
             | EditAction::SetFloatSlider(p, _)
-            | EditAction::SetColorChannel(p, _, _)
             | EditAction::SetColor(p, _)
             | EditAction::SetStopColor(p, _, _)
             | EditAction::EditText(p, _, _)
@@ -1559,17 +1530,12 @@ mod tests {
     }
 
     #[test]
-    fn color_channel_and_hex_edit() {
+    fn invalid_hex_edit_keeps_color_unchanged() {
         let (mut l, schema) = loaded();
         let path = "decoration:shadow:color";
-        l.apply(
-            EditAction::SetColorChannel(path.into(), ColorChannel::R, 0x10),
-            schema,
-        );
-        match l.config.get(path) {
-            Some(Value::Color(c)) => assert_eq!(c.r, 0x10),
-            other => panic!("expected color, got {other:?}"),
-        }
+        // Establish a known color, the way the visual picker does.
+        let picked = Color::rgba(0x10, 0x20, 0x30, 0xff);
+        l.apply(EditAction::SetColor(path.into(), picked), schema);
         // hex field synced
         assert!(l.draft(path, Slot::Hex).is_some());
 
