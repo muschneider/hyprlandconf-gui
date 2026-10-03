@@ -4,7 +4,12 @@ Name=hyprconf
 GenericName=Hyprland Configuration Editor
 Comment=View and edit the full surface of Hyprland configuration (Lua & conf)
 Exec=hyprconf
+Icon=hyprconf
 Terminal=false
 Categories=Settings;Utility;DesktopSettings;
 Keywords=hyprland;wayland;config;configuration;
 StartupNotify=true
+# Must match the window's Wayland app_id / X11 WM_CLASS (see `APP_ID` in
+# crates/hyprconf-gui/src/main.rs), or docks and taskbars will show the running
+# window with the generic fallback icon.
+StartupWMClass=hyprconf

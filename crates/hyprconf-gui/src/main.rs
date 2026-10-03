@@ -12,6 +12,7 @@ mod diff;
 mod edit;
 mod fuzzy;
 mod load;
+mod migrate;
 mod profiles;
 mod save;
 mod settings;
@@ -20,21 +21,33 @@ mod view;
 #[cfg(test)]
 mod ui_tests;
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use iced::{Element, Size, Task, Theme};
 
+/// The Wayland `app_id` / X11 `WM_CLASS` the window announces itself under.
+///
+/// This is what a compositor or dock uses to pair the running window with an
+/// installed `.desktop` entry — and therefore with an icon. It must stay equal
+/// to the basename of `packaging/hyprconf.desktop` and to the icon name
+/// installed under `share/icons/hicolor/*/apps/`; if the three drift apart the
+/// window simply renders with the generic fallback icon.
+const APP_ID: &str = "hyprconf";
+
 use hyprconf_core::hyprctl::HyprlandInfo;
+use hyprconf_core::outputs::DetectedMonitor;
 use hyprconf_core::schema::{CollectionId, Schema};
+use hyprconf_core::structured::MonitorRule;
 use hyprconf_core::value::Color;
 use hyprconf_core::{ConfigFormat, Value};
 
 use crate::color_picker::{ColorDraft, ColorTarget};
-use crate::edit::{EditAction, EditSnapshot};
+use crate::edit::{EditAction, EditSnapshot, MonitorEdit};
 use crate::load::{LoadState, Loaded};
+use crate::migrate::{Migration, Step as MigrateStep};
 use crate::settings::Settings;
 
 fn main() -> anyhow::Result<()> {
@@ -58,18 +71,39 @@ fn main() -> anyhow::Result<()> {
     let size = Size::new(settings.window_width, settings.window_height);
     let explicit = args.config;
 
+    let migrate = args.migrate;
+
     iced::application(
-        move || App::boot(explicit.clone(), settings.clone()),
+        move || App::boot(explicit.clone(), settings.clone(), migrate),
         App::update,
         App::view,
     )
     .title(App::title)
     .theme(App::theme)
     .subscription(App::subscription)
-    .window_size(size)
+    .window(window_settings(size))
     .run()?;
 
     Ok(())
+}
+
+/// The window configuration: restored size plus the identity the desktop needs
+/// to find our icon.
+///
+/// Note there is deliberately no [`iced::window::Settings::icon`] here. Wayland
+/// has no per-window icon in the core protocol, so a pixel buffer handed to
+/// winit would be silently dropped on exactly the compositor this app targets.
+/// The icon is instead resolved the way the desktop expects: `app_id` ->
+/// `hyprconf.desktop` -> `Icon=hyprconf` -> `hicolor/*/apps/hyprconf.png`.
+fn window_settings(size: Size) -> iced::window::Settings {
+    iced::window::Settings {
+        size,
+        platform_specific: iced::window::settings::PlatformSpecific {
+            application_id: APP_ID.to_owned(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
 }
 
 /// Parsed command-line arguments.
@@ -77,9 +111,10 @@ fn main() -> anyhow::Result<()> {
 struct Args {
     config: Option<PathBuf>,
     check: bool,
+    migrate: bool,
 }
 
-/// Parse `--config <path>` / `--config=<path>` and `--check`.
+/// Parse `--config <path>` / `--config=<path>`, `--check` and `--migrate`.
 fn parse_args() -> Args {
     let mut parsed = Args::default();
     let mut args = std::env::args().skip(1);
@@ -90,6 +125,8 @@ fn parse_args() -> Args {
             parsed.config = args.next().map(PathBuf::from);
         } else if arg == "--check" {
             parsed.check = true;
+        } else if arg == "--migrate" {
+            parsed.migrate = true;
         }
     }
     parsed
@@ -99,12 +136,16 @@ fn parse_args() -> Args {
 fn run_check(explicit: Option<PathBuf>) -> anyhow::Result<()> {
     match load::load_config(explicit) {
         LoadState::Loaded(loaded) => {
+            // Lua code kept verbatim (loops, helpers) is not a problem; only
+            // the rest are warnings.
+            let code = loaded.dynamic_regions;
             println!(
-                "loaded {} config: {} ({} options set, {} warnings, {} included file(s))",
+                "loaded {} config: {} ({} options set, {} warnings, {} Lua code block(s) kept as-is, {} included file(s))",
                 load::format_label(loaded.format),
                 loaded.source.display(),
                 loaded.config.option_count(),
-                loaded.warnings,
+                loaded.diagnostics.len().saturating_sub(code),
+                code,
                 loaded.included_files,
             );
             Ok(())
@@ -139,6 +180,47 @@ pub(crate) enum Selection {
     Collection(CollectionId),
 }
 
+/// Which subset of a section's options a pane shows.
+///
+/// A single section can hold sixty options, the vast majority of them left at
+/// their default. Filtering is what turns that wall into something you can
+/// actually work in — "what did I change?" and "what is even set?" are the two
+/// questions a config editor gets asked constantly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum OptionFilter {
+    /// Every option in the section.
+    #[default]
+    All,
+    /// Only options the configuration file actually sets.
+    Set,
+    /// Only options with unsaved edits.
+    Modified,
+}
+
+impl OptionFilter {
+    /// The filters offered, in display order.
+    pub(crate) const ALL: [OptionFilter; 3] =
+        [OptionFilter::All, OptionFilter::Set, OptionFilter::Modified];
+
+    /// The chip label.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            OptionFilter::All => "all",
+            OptionFilter::Set => "set",
+            OptionFilter::Modified => "modified",
+        }
+    }
+
+    /// Whether an option passes this filter.
+    pub(crate) fn keeps(self, loaded: &Loaded, path: &str) -> bool {
+        match self {
+            OptionFilter::All => true,
+            OptionFilter::Set => loaded.config.get(path).is_some(),
+            OptionFilter::Modified => loaded.is_dirty(path),
+        }
+    }
+}
+
 /// Messages produced by the UI and async tasks.
 #[derive(Debug, Clone)]
 pub(crate) enum Message {
@@ -162,6 +244,8 @@ pub(crate) enum Message {
     ToggleChanges,
     /// Open/close the save panel.
     ToggleSave,
+    /// Open/close the diagnostics panel (issues found while loading).
+    ToggleDiagnostics,
     /// Choose the output format in the save panel.
     SetOutputFormat(ConfigFormat),
     /// Toggle "save despite warnings".
@@ -170,6 +254,18 @@ pub(crate) enum Message {
     PerformSave,
     /// A background Hyprland detection finished.
     HyprlandDetected(Option<HyprlandInfo>),
+    /// A background output detection finished (`hyprctl monitors all -j`).
+    MonitorsDetected(Arc<Result<Vec<DetectedMonitor>, String>>),
+    /// Re-read the attached displays.
+    RefreshMonitors,
+    /// Edit the rule governing a physically attached output, by connector name.
+    /// The rule is created (seeded from the display's current state) if the
+    /// config doesn't mention it yet.
+    MonitorEdit(String, MonitorEdit),
+    /// A monitor was dropped after being dragged in the layout view.
+    MonitorDropped(String),
+    /// Show/hide a monitor card's advanced fields, by connector name.
+    ToggleMonitorAdvanced(String),
     /// Toggle live-apply (push committed scalar edits via `hyprctl keyword`).
     ToggleLiveApply(bool),
     /// Ask the running Hyprland to reload its config.
@@ -198,6 +294,43 @@ pub(crate) enum Message {
     PickSatVal(f32, f32),
     /// The hue strip reported a new hue (degrees).
     PickHue(f32),
+
+    // -- `.conf` -> Lua migration ---------------------------------------
+    /// Open the guided migration flow.
+    StartMigration,
+    /// Move to a specific step of the flow.
+    MigrateGoto(MigrateStep),
+    /// Hand the generated Lua to `Hyprland --verify-config`.
+    MigrateCheck,
+    /// The verification finished.
+    MigrateChecked(Box<hyprconf_core::verify::Verdict>),
+    /// Proceed even though the check did not pass (or could not run).
+    MigrateOverride(bool),
+    /// Write the migrated config to disk.
+    MigrateApply,
+    /// The write finished.
+    MigrateApplied(Box<Result<migrate::Applied, String>>),
+    /// Leave the migration flow.
+    CloseMigration,
+    /// Hide the deprecation banner for this session.
+    DismissDeprecation,
+    /// Move keyboard focus to the search field (Ctrl+F).
+    FocusSearch,
+    /// Narrow a section pane to all / set / modified options.
+    SetOptionFilter(OptionFilter),
+    /// Escape: back out of whatever is in front (modal → panel → search).
+    Escape,
+    /// Show/hide the keyboard-shortcut sheet.
+    ToggleShortcuts,
+    /// Clear the transient save / `hyprctl` status line.
+    DismissStatus,
+    /// Split a gap option into per-side fields, or link the sides back into
+    /// one value.
+    ToggleGapSides(String),
+    /// Expand/collapse a collection entry's editor.
+    ToggleRow(CollectionId, usize),
+    /// The collection filter box changed.
+    CollectionFilter(String),
 }
 
 /// Top-level application state.
@@ -211,6 +344,8 @@ pub(crate) struct App {
     pub(crate) show_changes: bool,
     /// Whether the save panel is open.
     pub(crate) show_save: bool,
+    /// Whether the diagnostics panel (load-time issues) is open.
+    pub(crate) show_diagnostics: bool,
     /// The chosen output format (defaults to the loaded format).
     pub(crate) output_format: Option<ConfigFormat>,
     /// "Save despite soft warnings".
@@ -225,6 +360,13 @@ pub(crate) struct App {
     pub(crate) last_key: Option<String>,
     /// A detected running Hyprland, if any.
     pub(crate) hyprland: Option<HyprlandInfo>,
+    /// The displays currently attached, newest detection wins. Empty when
+    /// Hyprland isn't running or `hyprctl` failed.
+    pub(crate) outputs: Vec<DetectedMonitor>,
+    /// Why the last output detection failed, if it did.
+    pub(crate) outputs_error: Option<String>,
+    /// Monitor cards whose advanced fields are expanded, by connector.
+    pub(crate) expanded_monitors: HashSet<String>,
     /// Whether committed scalar edits are pushed live via `hyprctl`.
     pub(crate) live_apply: bool,
     /// The last `hyprctl` status line, if any.
@@ -245,12 +387,51 @@ pub(crate) struct App {
     /// When the window size was last written to disk, to throttle the otherwise
     /// per-event writes during a continuous drag-resize. `None` until first set.
     pub(crate) last_window_persist: Option<Instant>,
+    /// The in-progress `.conf` -> Lua migration, if the flow is open.
+    pub(crate) migration: Option<Migration>,
+    /// Whether the `.conf` deprecation banner was dismissed this session.
+    pub(crate) deprecation_dismissed: bool,
+    /// Set by `--migrate`: open the conversion flow once the config has loaded.
+    pub(crate) migrate_on_load: bool,
+
+    // -- derived caches -------------------------------------------------
+    // Everything below is a *projection* of the state above. `view` runs on
+    // every frame, so anything that costs more than a field read is computed
+    // here in `update` instead — once per change rather than once per frame.
+    /// Scored search hits for the current query. Rebuilt only when the query
+    /// (or the schema-relevant state) changes.
+    pub(crate) hits: fuzzy::SearchIndex,
+    /// Saved profiles. Refreshed when the panel opens or a profile is written,
+    /// so `view` never touches the filesystem.
+    pub(crate) profiles: Vec<profiles::Profile>,
+    /// How many set options need a newer Hyprland than the detected one.
+    pub(crate) stale_options: usize,
+    /// Unsaved-edit counts per schema section, indexed like `schema.sections()`.
+    pub(crate) dirty_by_section: Vec<u32>,
+    /// The live window width. `settings.window_width` is the *persisted* value
+    /// and lags a resize; layout decisions must use this one.
+    pub(crate) window_width: f32,
+    /// Which options the section panes show.
+    pub(crate) option_filter: OptionFilter,
+    /// Whether the keyboard-shortcut sheet is open.
+    pub(crate) show_shortcuts: bool,
+    /// Gap options the user split into per-side fields (a uniform value would
+    /// otherwise collapse back to a single field on the next frame).
+    pub(crate) split_gaps: HashSet<String>,
+    /// Collection entries whose editors are expanded.
+    pub(crate) expanded_rows: HashSet<(CollectionId, usize)>,
+    /// The collection pane's filter text.
+    pub(crate) collection_filter: String,
 }
 
 impl App {
     /// Boot: build the initial state and kick off the (non-blocking) load and
     /// Hyprland detection.
-    fn boot(explicit: Option<PathBuf>, settings: Settings) -> (Self, Task<Message>) {
+    fn boot(
+        explicit: Option<PathBuf>,
+        settings: Settings,
+        migrate_on_load: bool,
+    ) -> (Self, Task<Message>) {
         let schema = Schema::shared();
         let selected = schema
             .sections()
@@ -258,6 +439,7 @@ impl App {
             .map(|s| Selection::Section(s.id.clone()))
             .unwrap_or(Selection::Collection(CollectionId::Keybinds));
 
+        let window_width = settings.window_width;
         let app = Self {
             theme: theme_from_name(&settings.theme),
             schema,
@@ -266,6 +448,7 @@ impl App {
             search: String::new(),
             show_changes: false,
             show_save: false,
+            show_diagnostics: false,
             output_format: Some(format_from_name(&settings.last_format)),
             override_warnings: false,
             save_status: None,
@@ -273,6 +456,9 @@ impl App {
             redo: VecDeque::new(),
             last_key: None,
             hyprland: None,
+            outputs: Vec::new(),
+            outputs_error: None,
+            expanded_monitors: HashSet::new(),
             live_apply: false,
             hypr_status: None,
             settings,
@@ -282,6 +468,20 @@ impl App {
             color_picker: None,
             save_preview: None,
             last_window_persist: None,
+            migration: None,
+            deprecation_dismissed: false,
+            migrate_on_load,
+
+            hits: fuzzy::SearchIndex::default(),
+            profiles: Vec::new(),
+            stale_options: 0,
+            dirty_by_section: vec![0; schema.sections().len()],
+            window_width,
+            option_filter: OptionFilter::default(),
+            show_shortcuts: false,
+            split_gaps: HashSet::new(),
+            expanded_rows: HashSet::new(),
+            collection_filter: String::new(),
         };
 
         let load = Task::perform(async move { load::load_config(explicit) }, |state| {
@@ -292,7 +492,7 @@ impl App {
             Message::HyprlandDetected,
         );
 
-        (app, Task::batch([load, detect]))
+        (app, Task::batch([load, detect, detect_monitors()]))
     }
 
     fn title(&self) -> String {
@@ -324,7 +524,7 @@ impl App {
                         format = load::format_label(loaded.format),
                         source = %loaded.source.display(),
                         options = loaded.config.option_count(),
-                        warnings = loaded.warnings,
+                        warnings = loaded.diagnostics.len(),
                         "configuration loaded",
                     ),
                     LoadState::NotFound { searched } => {
@@ -338,11 +538,14 @@ impl App {
                 // The message holds the only `Arc`, so unwrap it to take the
                 // `LoadState` (incl. the parsed `ConfBundle`) without deep-cloning.
                 self.load = Arc::try_unwrap(state).unwrap_or_else(|arc| (*arc).clone());
-                // A fresh load invalidates the edit history and open picker.
+                // A fresh load invalidates the edit history, the open picker
+                // and any per-row UI state.
                 self.undo.clear();
                 self.redo.clear();
                 self.last_key = None;
                 self.color_picker = None;
+                self.expanded_rows.clear();
+                self.split_gaps.clear();
 
                 let recent = match &self.load {
                     LoadState::Loaded(loaded) => Some(loaded.source.display().to_string()),
@@ -353,28 +556,90 @@ impl App {
                     self.settings.save();
                 }
                 self.refresh_save_preview();
+                self.refresh_dirty_index();
+                self.refresh_stale();
+
+                // `--migrate` opens the conversion flow as soon as there is
+                // something to convert. Consumed once so re-loading a file later
+                // does not re-open it.
+                if std::mem::take(&mut self.migrate_on_load) && self.show_deprecation_banner() {
+                    return Task::done(Message::StartMigration);
+                }
             }
             Message::Selected(selection) => {
+                if self.selected != selection {
+                    self.collection_filter.clear();
+                }
                 self.selected = selection;
                 self.search.clear();
+                self.hits = fuzzy::SearchIndex::default();
                 self.show_changes = false;
                 self.show_save = false;
                 self.show_profiles = false;
+                self.show_diagnostics = false;
                 self.color_picker = None;
             }
-            Message::SearchChanged(query) => self.search = query,
+            Message::SearchChanged(query) => {
+                // Scoring the whole schema happens here, once per keystroke —
+                // never in `view`, which runs on every frame.
+                self.hits = fuzzy::SearchIndex::build(self.schema, &query);
+                self.search = query;
+            }
             Message::Edit(action) => return self.apply_edit(action),
             Message::CollectionEdit(action) => {
                 self.record(action.coalesce_key());
+                let id = action.collection();
+                // Row state is index-based: anything that shifts indices
+                // invalidates it. A freshly added entry opens ready to edit.
+                let added = matches!(action, edit::CollectionAction::Add(_));
+                if action.is_structural() {
+                    self.expanded_rows.retain(|(c, _)| *c != id);
+                }
                 if let LoadState::Loaded(loaded) = &mut self.load {
                     loaded.apply_collection(action);
                 }
+                if added {
+                    let count = self.collection_len(id);
+                    if count > 0 {
+                        self.expanded_rows.insert((id, count - 1));
+                    }
+                    self.collection_filter.clear();
+                }
+            }
+            Message::ToggleRow(id, index) => {
+                if !self.expanded_rows.remove(&(id, index)) {
+                    self.expanded_rows.insert((id, index));
+                }
+            }
+            Message::CollectionFilter(text) => self.collection_filter = text,
+            Message::ToggleGapSides(path) => {
+                let split = self.split_gaps.contains(&path)
+                    || self.load.loaded().is_some_and(|l| {
+                        self.schema
+                            .option(&path)
+                            .is_some_and(|o| !l.current_gap(&path, o).is_uniform())
+                    });
+                if split {
+                    // Link: every side takes the top value.
+                    self.split_gaps.remove(&path);
+                    let top = self
+                        .load
+                        .loaded()
+                        .zip(self.schema.option(&path))
+                        .map_or(0, |(l, o)| l.current_gap(&path, o).top);
+                    return self.apply_edit(EditAction::SetGap(
+                        path,
+                        hyprconf_core::value::CssGap::uniform(top),
+                    ));
+                }
+                self.split_gaps.insert(path);
             }
             Message::Undo => {
                 self.last_key = None;
                 let Some(prev) = self.undo.pop_back() else {
                     return Task::none();
                 };
+                let lens = self.collection_lens();
                 if let LoadState::Loaded(loaded) = &mut self.load {
                     let current = loaded.snapshot();
                     loaded.restore(prev);
@@ -382,13 +647,16 @@ impl App {
                 } else {
                     self.undo.push_back(prev);
                 }
+                self.prune_rows(&lens);
                 self.refresh_save_preview();
+                self.refresh_dirty_index();
             }
             Message::Redo => {
                 self.last_key = None;
                 let Some(next) = self.redo.pop_back() else {
                     return Task::none();
                 };
+                let lens = self.collection_lens();
                 if let LoadState::Loaded(loaded) = &mut self.load {
                     let current = loaded.snapshot();
                     loaded.restore(next);
@@ -396,13 +664,16 @@ impl App {
                 } else {
                     self.redo.push_back(next);
                 }
+                self.prune_rows(&lens);
                 self.refresh_save_preview();
+                self.refresh_dirty_index();
             }
             Message::ToggleChanges => {
                 self.show_changes = !self.show_changes;
                 if self.show_changes {
                     self.show_save = false;
                     self.show_profiles = false;
+                    self.show_diagnostics = false;
                 }
             }
             Message::ToggleSave => {
@@ -410,12 +681,21 @@ impl App {
                 if self.show_save {
                     self.show_changes = false;
                     self.show_profiles = false;
+                    self.show_diagnostics = false;
                     self.save_status = None;
                     if self.output_format.is_none() {
                         self.output_format = self.load.loaded().map(|l| l.format);
                     }
                 }
                 self.refresh_save_preview();
+            }
+            Message::ToggleDiagnostics => {
+                self.show_diagnostics = !self.show_diagnostics;
+                if self.show_diagnostics {
+                    self.show_changes = false;
+                    self.show_save = false;
+                    self.show_profiles = false;
+                }
             }
             Message::SetOutputFormat(format) => {
                 self.output_format = Some(format);
@@ -432,6 +712,37 @@ impl App {
                 }
                 tracing::info!(detected = info.is_some(), "hyprland detection");
                 self.hyprland = info;
+                self.refresh_stale();
+            }
+            Message::MonitorsDetected(result) => match &*result {
+                Ok(outputs) => {
+                    tracing::info!(count = outputs.len(), "output detection");
+                    self.outputs_error = None;
+                    self.outputs = Arc::try_unwrap(result)
+                        .unwrap_or_else(|arc| (*arc).clone())
+                        .unwrap_or_default();
+                }
+                Err(message) => {
+                    // Not an error the user needs shouting about: no Hyprland,
+                    // no displays. The screen degrades to the raw rule list.
+                    tracing::debug!(error = %message, "output detection unavailable");
+                    self.outputs.clear();
+                    self.outputs_error = Some(message.clone());
+                }
+            },
+            Message::RefreshMonitors => return detect_monitors(),
+            Message::MonitorEdit(connector, edit) => {
+                return self.edit_monitor(&connector, edit);
+            }
+            Message::MonitorDropped(connector) => {
+                // Applied once on release rather than on every drag frame, so a
+                // drag costs one `hyprctl` call instead of hundreds.
+                return self.live_apply_monitor(&connector);
+            }
+            Message::ToggleMonitorAdvanced(connector) => {
+                if !self.expanded_monitors.remove(&connector) {
+                    self.expanded_monitors.insert(connector);
+                }
             }
             Message::ToggleLiveApply(on) => {
                 self.live_apply = on && self.hyprland.is_some();
@@ -450,6 +761,10 @@ impl App {
                 self.hypr_status = Some(result);
             }
             Message::WindowResized(width, height) => {
+                // Layout reads `self.window_width`, which is always current;
+                // `settings` only mirrors it for the *next* launch and is
+                // written to disk at most a few times a second (below).
+                self.window_width = width;
                 self.settings.window_width = width;
                 self.settings.window_height = height;
                 // Throttle disk writes to ~2/sec so a continuous drag-resize
@@ -469,7 +784,11 @@ impl App {
                 if self.show_profiles {
                     self.show_changes = false;
                     self.show_save = false;
+                    self.show_diagnostics = false;
                     self.save_status = None;
+                    // Read the directory here, not in `view` — a `read_dir` per
+                    // frame is filesystem I/O on the render path.
+                    self.profiles = profiles::list();
                 }
             }
             Message::ProfileNameChanged(name) => self.profile_name = name,
@@ -480,6 +799,7 @@ impl App {
                         profiles::save(&self.profile_name, format, &loaded.config)
                             .map(|path| format!("Saved profile → {}", path.display())),
                     );
+                    self.profiles = profiles::list();
                 }
             }
             Message::ImportPathChanged(path) => self.import_path = path,
@@ -528,8 +848,219 @@ impl App {
                 );
                 return self.apply_pick(pick_action(&target, color));
             }
+
+            // -- migration ---------------------------------------------
+            Message::StartMigration => {
+                let Some(loaded) = self.load.loaded() else {
+                    return Task::none();
+                };
+                tracing::info!(source = ?loaded.source, "starting .conf -> lua migration");
+                self.migration = Some(Migration::start(loaded));
+                self.close_panels();
+                // Check eagerly: the verdict is the whole point of the flow, and
+                // it is cheap enough that the user should never have to ask.
+                return Task::done(Message::MigrateCheck);
+            }
+            Message::MigrateGoto(step) => {
+                if let Some(m) = self.migration.as_mut() {
+                    m.step = step;
+                }
+            }
+            Message::MigrateCheck => {
+                let Some(m) = self.migration.as_mut() else {
+                    return Task::none();
+                };
+                m.checking = true;
+                let lua = m.lua.clone();
+                return Task::perform(
+                    async move { hyprconf_core::verify::verify_text(&lua, "lua") },
+                    |verdict| Message::MigrateChecked(Box::new(verdict)),
+                );
+            }
+            Message::MigrateChecked(verdict) => {
+                if let Some(m) = self.migration.as_mut() {
+                    m.checking = false;
+                    tracing::info!(ok = verdict.is_ok(), "migration check finished");
+                    m.verdict = Some(*verdict);
+                }
+            }
+            Message::MigrateOverride(on) => {
+                if let Some(m) = self.migration.as_mut() {
+                    m.override_check = on;
+                }
+            }
+            Message::MigrateApply => {
+                let Some(m) = self.migration.as_mut() else {
+                    return Task::none();
+                };
+                m.step = MigrateStep::Done;
+                let (target, lua) = (m.target.clone(), m.lua.clone());
+                return Task::perform(async move { migrate::apply(target, lua) }, |result| {
+                    Message::MigrateApplied(Box::new(result))
+                });
+            }
+            Message::MigrateApplied(result) => {
+                let result = *result;
+                match &result {
+                    Ok(a) => tracing::info!(written = ?a.written, "migration applied"),
+                    Err(e) => tracing::error!(error = %e, "migration failed"),
+                }
+                let reload = result.as_ref().ok().map(|a| a.written.clone());
+                if let Some(m) = self.migration.as_mut() {
+                    m.outcome = Some(result);
+                }
+                // Re-open the freshly written Lua so the editor now works against
+                // the file Hyprland will actually read.
+                if let Some(path) = reload {
+                    self.settings.last_format = "lua".to_string();
+                    self.settings.save();
+                    self.output_format = Some(ConfigFormat::Lua);
+                    return Task::perform(async move { load::load_config(Some(path)) }, |state| {
+                        Message::Loaded(Arc::new(state))
+                    });
+                }
+            }
+            Message::CloseMigration => self.migration = None,
+            Message::DismissDeprecation => self.deprecation_dismissed = true,
+            Message::FocusSearch => {
+                return iced::advanced::widget::operate(
+                    iced::advanced::widget::operation::focusable::focus(view::SEARCH_ID.into()),
+                );
+            }
+            Message::SetOptionFilter(filter) => self.option_filter = filter,
+            Message::ToggleShortcuts => self.show_shortcuts = !self.show_shortcuts,
+            Message::DismissStatus => {
+                self.save_status = None;
+                self.hypr_status = None;
+            }
+            Message::Escape => return self.escape(),
         }
         Task::none()
+    }
+
+    /// Back out of exactly one layer, outermost first.
+    ///
+    /// Escape that closes *everything* is as annoying as Escape that closes
+    /// nothing: the user loses context they didn't ask to lose. So this peels
+    /// one layer per press, in the order things visually stack.
+    fn escape(&mut self) -> Task<Message> {
+        if self.show_shortcuts {
+            self.show_shortcuts = false;
+        } else if self.color_picker.is_some() {
+            self.color_picker = None;
+        } else if !self.search.is_empty() {
+            self.search.clear();
+            self.hits = fuzzy::SearchIndex::default();
+        } else if self.show_save || self.show_changes || self.show_profiles || self.show_diagnostics
+        {
+            self.close_panels();
+            self.save_preview = None;
+        } else if self.save_status.is_some() || self.hypr_status.is_some() {
+            self.save_status = None;
+            self.hypr_status = None;
+        }
+        Task::none()
+    }
+
+    /// How many entries a collection holds right now.
+    fn collection_len(&self, id: CollectionId) -> usize {
+        let Some(loaded) = self.load.loaded() else {
+            return 0;
+        };
+        let c = &loaded.config;
+        match id {
+            CollectionId::Monitors => c.monitors.len(),
+            CollectionId::Workspaces => c.workspaces.len(),
+            CollectionId::WindowRules => c.window_rules.len(),
+            CollectionId::LayerRules => c.layer_rules.len(),
+            CollectionId::Keybinds => c.keybinds.len(),
+            CollectionId::Submaps => c.submaps.len(),
+            CollectionId::Env => c.env.len(),
+            CollectionId::Execs => c.execs.len(),
+            CollectionId::Variables => c.variables.len(),
+            CollectionId::Beziers => c.beziers.len(),
+            CollectionId::Animations => c.animations.len(),
+            CollectionId::Gestures => c.gestures.len(),
+            CollectionId::Devices => c.devices.len(),
+            CollectionId::Permissions => c.permissions.len(),
+            CollectionId::Plugins => c.plugins.len(),
+        }
+    }
+
+    /// Every collection's current length.
+    fn collection_lens(&self) -> Vec<(CollectionId, usize)> {
+        self.schema
+            .collections()
+            .iter()
+            .map(|c| (c.id, self.collection_len(c.id)))
+            .collect()
+    }
+
+    /// Forget expanded rows of collections whose length changed since `before`
+    /// (an undone add/remove shifts every index after it). Field-level undos
+    /// keep the row you are editing open.
+    fn prune_rows(&mut self, before: &[(CollectionId, usize)]) {
+        for &(id, len) in before {
+            if self.collection_len(id) != len {
+                self.expanded_rows.retain(|(c, _)| *c != id);
+            }
+        }
+    }
+
+    /// Recount unsaved scalar edits per section, for the sidebar badges.
+    ///
+    /// One pass over the schema (a few hundred set lookups) per *edit*, versus
+    /// the same pass per *frame* if `view` did it.
+    fn refresh_dirty_index(&mut self) {
+        let Some(loaded) = self.load.loaded() else {
+            self.dirty_by_section.iter_mut().for_each(|n| *n = 0);
+            return;
+        };
+        self.dirty_by_section = self
+            .schema
+            .sections()
+            .iter()
+            .map(|section| {
+                section
+                    .options
+                    .iter()
+                    .filter(|o| loaded.is_dirty(&o.path))
+                    .count() as u32
+            })
+            .collect();
+    }
+
+    /// Recount options the running Hyprland is too old for.
+    ///
+    /// Only the *count* is kept: the status bar shows a number, and recomputing
+    /// the full problem list on every frame (which is what it used to do) is
+    /// pure waste.
+    fn refresh_stale(&mut self) {
+        self.stale_options = match (self.load.loaded(), &self.hyprland) {
+            (Some(loaded), Some(info)) => {
+                hyprconf_core::unsupported_options(self.schema, &loaded.config, &info.version).len()
+            }
+            _ => 0,
+        };
+    }
+
+    /// Close every side panel (used when a full-screen flow takes over).
+    fn close_panels(&mut self) {
+        self.show_changes = false;
+        self.show_save = false;
+        self.show_profiles = false;
+        self.show_diagnostics = false;
+        self.color_picker = None;
+    }
+
+    /// Whether the `.conf` deprecation banner should be shown right now.
+    pub(crate) fn show_deprecation_banner(&self) -> bool {
+        !self.deprecation_dismissed
+            && self.migration.is_none()
+            && self
+                .load
+                .loaded()
+                .is_some_and(|l| migrate::should_warn(l.format))
     }
 
     /// Push an undo snapshot for an edit, coalescing consecutive continuous
@@ -551,6 +1082,77 @@ impl App {
         }
     }
 
+    /// Apply an edit to the rule governing `connector`.
+    ///
+    /// The Monitors screen speaks in connectors; the file speaks in rules. This
+    /// resolves one to the other, creating a rule seeded from the display's
+    /// current state when the config has nothing to say about it — so merely
+    /// touching a display never changes how it runs.
+    fn edit_monitor(&mut self, connector: &str, edit: MonitorEdit) -> Task<Message> {
+        // Position edits stream in during a drag and coalesce into one undo
+        // step; the toggle deliberately does not (see `monitor_field_tag`).
+        let key = (!matches!(edit, MonitorEdit::Enabled(..)))
+            .then(|| format!("mon:{connector}:{}", edit::monitor_field_tag(&edit)));
+        let dragging = matches!(edit, MonitorEdit::Position(_));
+        self.record(key);
+
+        let seed = self.monitor_seed(connector);
+        if let LoadState::Loaded(loaded) = &mut self.load {
+            loaded.edit_monitor(&seed, edit);
+        }
+        // A drag is applied on release instead — one `hyprctl` call, not one
+        // per frame.
+        if dragging {
+            return Task::none();
+        }
+        self.live_apply_monitor(connector)
+    }
+
+    /// A rule reproducing a display's current state, used to seed a new entry.
+    ///
+    /// Falls back to Hyprland's own defaults when the display isn't detected
+    /// (no compositor running), which is the best we can honestly do.
+    fn monitor_seed(&self, connector: &str) -> MonitorRule {
+        match self.outputs.iter().find(|o| o.name == connector) {
+            Some(o) => MonitorRule {
+                name: o.name.clone(),
+                mode: o.current_mode(),
+                position: o.current_position(),
+                scale: crate::edit::fmt_num(o.scale),
+                extra: Vec::new(),
+            },
+            None => MonitorRule {
+                name: connector.to_string(),
+                mode: "preferred".into(),
+                position: "auto".into(),
+                scale: "1".into(),
+                extra: Vec::new(),
+            },
+        }
+    }
+
+    /// Push a monitor rule to the running Hyprland (`hyprctl keyword monitor`)
+    /// and re-read the resulting layout, when live-apply is on.
+    fn live_apply_monitor(&self, connector: &str) -> Task<Message> {
+        if !self.live_apply || self.hyprland.is_none() {
+            return Task::none();
+        }
+        let Some(loaded) = self.load.loaded() else {
+            return Task::none();
+        };
+        let Some(i) = edit::monitor_rule_index(&loaded.config.monitors, connector) else {
+            return Task::none();
+        };
+        let rule = loaded.config.monitors[i].value.clone();
+        Task::perform(
+            async move { hyprconf_core::hyprctl::apply_monitor(&rule).map_err(|e| e.to_string()) },
+            Message::HyprResult,
+        )
+        // The compositor may not honour the request verbatim (an unsupported
+        // mode, a layout it re-flows); re-reading keeps the view truthful.
+        .chain(detect_monitors())
+    }
+
     /// If live-apply is on and the edited option is valid, push it to the
     /// running Hyprland via `hyprctl keyword`.
     fn live_apply_task(&self, path: Option<String>) -> Task<Message> {
@@ -569,10 +1171,12 @@ impl App {
         let Some(value) = loaded.config.get(&path) else {
             return Task::none();
         };
-        let value_text = hyprconf_core::conf::value_to_conf(value);
+        // `apply_option` picks `hyprctl keyword` or `hyprctl eval` depending
+        // on whether the session runs a `.conf` or a Lua config.
+        let value = value.clone();
         Task::perform(
             async move {
-                hyprconf_core::hyprctl::apply_keyword(&path, &value_text).map_err(|e| e.to_string())
+                hyprconf_core::hyprctl::apply_option(&path, &value).map_err(|e| e.to_string())
             },
             Message::HyprResult,
         )
@@ -605,6 +1209,7 @@ impl App {
                 self.sync_color_picker(path);
             }
         }
+        self.refresh_dirty_index();
         self.live_apply_task(path)
     }
 
@@ -689,11 +1294,12 @@ impl App {
         let outcome: Option<(Result<String, String>, Option<PathBuf>)> = match self.load.loaded() {
             Some(loaded) => {
                 let target = self.output_format.unwrap_or(loaded.format);
-                let problems = save::review(loaded, self.schema);
+                let plan = save::plan_save(loaded, target);
+                let mut problems = save::review(loaded, self.schema);
+                problems.extend(save::plan_problems(&plan));
                 if let Some(reason) = save::blocked(&problems, self.override_warnings) {
                     Some((Err(reason), None))
                 } else {
-                    let plan = save::plan_save(loaded, target);
                     match save::perform_save(&plan) {
                         Ok(reports) => {
                             let backups = reports.iter().filter(|r| r.backup.is_some()).count();
@@ -734,25 +1340,45 @@ impl App {
     }
 }
 
+/// Re-read the attached displays off the UI thread.
+fn detect_monitors() -> Task<Message> {
+    Task::perform(
+        async { hyprconf_core::hyprctl::monitors().map_err(|e| e.to_string()) },
+        |result| Message::MonitorsDetected(Arc::new(result)),
+    )
+}
+
 /// Translate a raw window event into a [`Message`] (keyboard shortcuts).
+///
+/// Escape is handled without a modifier — it is the one key users reach for to
+/// get out of something, and requiring Ctrl for it would defeat the point.
 fn handle_event(
     event: iced::Event,
     _status: iced::event::Status,
     _window: iced::window::Id,
 ) -> Option<Message> {
+    use iced::keyboard::key::Named;
     use iced::keyboard::{Event as KeyEvent, Key};
 
     let iced::Event::Keyboard(KeyEvent::KeyPressed { key, modifiers, .. }) = event else {
         return None;
     };
     if !modifiers.command() {
-        return None;
+        return match key.as_ref() {
+            Key::Named(Named::Escape) => Some(Message::Escape),
+            _ => None,
+        };
     }
     match key.as_ref() {
         Key::Character("z") if modifiers.shift() => Some(Message::Redo),
         Key::Character("z") => Some(Message::Undo),
         Key::Character("y") => Some(Message::Redo),
         Key::Character("s") => Some(Message::ToggleSave),
+        // Ctrl+K alongside Ctrl+F: the command-palette muscle memory most
+        // people arrive with.
+        Key::Character("f" | "k") => Some(Message::FocusSearch),
+        Key::Character("p") => Some(Message::ToggleProfiles),
+        Key::Character("/") => Some(Message::ToggleShortcuts),
         _ => None,
     }
 }

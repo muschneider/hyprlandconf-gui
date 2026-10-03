@@ -123,11 +123,15 @@ fn maps_scalars_variables_and_directives() {
     let (config, warnings) = document_to_config(&doc, &schema);
 
     // scalar options parsed to typed values
-    assert_eq!(config.get("general:gaps_in"), Some(&Value::Int(5)));
+    assert_eq!(
+        config.get("general:gaps_in"),
+        Some(&Value::CssGap(hyprconf_core::value::CssGap::uniform(5)))
+    );
     assert_eq!(config.get("decoration:rounding"), Some(&Value::Int(5)));
+    // An open choice (custom `lua:<name>` layouts are valid): a string.
     assert_eq!(
         config.get("general:layout"),
-        Some(&Value::Enum("dwindle".into()))
+        Some(&Value::String("dwindle".into()))
     );
     assert_eq!(
         config.get("decoration:blur:enabled"),
@@ -220,7 +224,10 @@ fn follows_multi_file_includes() {
     let (config, _warnings) = bundle_to_config(&bundle, &schema);
 
     // main.conf's `gaps_in = 8` is evaluated after the includes (last wins).
-    assert_eq!(config.get("general:gaps_in"), Some(&Value::Int(8)));
+    assert_eq!(
+        config.get("general:gaps_in"),
+        Some(&Value::CssGap(hyprconf_core::value::CssGap::uniform(8)))
+    );
 
     // colors.conf's `$active` expanded into the border color.
     match config.get("general:col.active_border") {

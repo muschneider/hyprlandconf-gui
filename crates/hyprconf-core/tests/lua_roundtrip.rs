@@ -113,7 +113,7 @@ fn lua_config_round_trips_via_serializer() {
     // Spot-check it actually parsed real content.
     assert_eq!(
         config_a.get("general:layout"),
-        Some(&Value::Enum("master".into()))
+        Some(&Value::String("master".into()))
     );
     assert_eq!(
         config_a.get("decoration:blur:enabled"),
@@ -231,7 +231,7 @@ fn numeric_mode_enums_round_trip_as_numbers() {
     );
     assert_eq!(
         from_lua.get("general:layout"),
-        Some(&Value::Enum("master".into()))
+        Some(&Value::String("master".into()))
     );
 
     // --- Conf: numeric variants are emitted and parsed verbatim. ---

@@ -36,6 +36,14 @@ pub enum ValueParseError {
         /// Why it was rejected.
         reason: &'static str,
     },
+    /// A CSS-style gap literal was malformed.
+    #[error("invalid gap {input:?}: {reason}")]
+    CssGap {
+        /// The offending input.
+        input: String,
+        /// Why it was rejected.
+        reason: &'static str,
+    },
 }
 
 /// An 8-bit-per-channel RGBA color.
@@ -317,6 +325,131 @@ impl fmt::Display for Vec2 {
     }
 }
 
+/// Per-side gaps, as Hyprland's `gaps_in` / `gaps_out` / `float_gaps` accept
+/// them: CSS shorthand in `.conf` (`5`, `5 10`, `5 10 15`, `5 10 15 20`) and an
+/// integer or a `{ top, right, bottom, left }` table in Lua.
+///
+/// Modelling these as a plain integer (as earlier versions did) silently
+/// rejected every per-side value on load — and Lua refuses the `.conf` string
+/// form outright (*"css_gap type requires an integer or a table"*).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CssGap {
+    /// Top gap in px.
+    pub top: i64,
+    /// Right gap in px.
+    pub right: i64,
+    /// Bottom gap in px.
+    pub bottom: i64,
+    /// Left gap in px.
+    pub left: i64,
+}
+
+impl CssGap {
+    /// The same gap on every side.
+    #[must_use]
+    pub const fn uniform(px: i64) -> Self {
+        Self {
+            top: px,
+            right: px,
+            bottom: px,
+            left: px,
+        }
+    }
+
+    /// Whether every side has the same value.
+    #[must_use]
+    pub fn is_uniform(&self) -> bool {
+        self.top == self.right && self.right == self.bottom && self.bottom == self.left
+    }
+
+    /// The sides in CSS order: top, right, bottom, left.
+    #[must_use]
+    pub const fn sides(&self) -> [i64; 4] {
+        [self.top, self.right, self.bottom, self.left]
+    }
+
+    /// Build from sides in CSS order: top, right, bottom, left.
+    #[must_use]
+    pub const fn from_sides([top, right, bottom, left]: [i64; 4]) -> Self {
+        Self {
+            top,
+            right,
+            bottom,
+            left,
+        }
+    }
+
+    /// A copy with one side (CSS order index `0..4`) replaced.
+    #[must_use]
+    pub fn with_side(&self, index: usize, px: i64) -> Self {
+        let mut sides = self.sides();
+        if let Some(slot) = sides.get_mut(index) {
+            *slot = px;
+        }
+        Self::from_sides(sides)
+    }
+
+    /// Parse CSS shorthand: one to four integers separated by whitespace and/or
+    /// commas, expanded exactly like CSS `margin`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValueParseError::CssGap`] for zero or more than four values, or
+    /// a value that is not an integer.
+    pub fn from_hyprland_str(input: &str) -> Result<Self, ValueParseError> {
+        let err = |reason: &'static str| ValueParseError::CssGap {
+            input: input.to_string(),
+            reason,
+        };
+        let cleaned = input.replace(',', " ");
+        let mut values = Vec::with_capacity(4);
+        for part in cleaned.split_whitespace() {
+            // Hyprland stores gaps as integers, but a float literal is a common
+            // hand-written slip; round rather than reject it.
+            let value = match part.parse::<i64>() {
+                Ok(v) => v,
+                Err(_) => part
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|f| f.is_finite())
+                    .map(|f| f.round() as i64)
+                    .ok_or_else(|| err("gaps must be whole numbers"))?,
+            };
+            values.push(value);
+        }
+        let sides = match values.as_slice() {
+            [a] => [*a, *a, *a, *a],
+            [v, h] => [*v, *h, *v, *h],
+            [t, h, b] => [*t, *h, *b, *h],
+            [t, r, b, l] => [*t, *r, *b, *l],
+            [] => return Err(err("expected one to four numbers")),
+            _ => return Err(err("at most four values (top right bottom left)")),
+        };
+        Ok(Self::from_sides(sides))
+    }
+
+    /// Render as the shortest equivalent CSS shorthand (`5`, `5 10`, ...).
+    #[must_use]
+    pub fn to_hyprland_string(&self) -> String {
+        let [t, r, b, l] = self.sides();
+        if self.is_uniform() {
+            t.to_string()
+        } else if t == b && r == l {
+            format!("{t} {r}")
+        } else if r == l {
+            format!("{t} {r} {b}")
+        } else {
+            format!("{t} {r} {b} {l}")
+        }
+    }
+}
+
+impl fmt::Display for CssGap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_hyprland_string())
+    }
+}
+
 /// A concrete, *scalar* configuration value.
 ///
 /// Repeatable/structured constructs (keybinds, rules, ...) are **not** modelled
@@ -340,6 +473,8 @@ pub enum Value {
     Enum(String),
     /// A 2D vector.
     Vec2(Vec2),
+    /// Per-side gaps (CSS shorthand).
+    CssGap(CssGap),
 }
 
 impl Value {
@@ -355,6 +490,7 @@ impl Value {
             Value::String(_) => "string",
             Value::Enum(_) => "enum",
             Value::Vec2(_) => "vec2",
+            Value::CssGap(_) => "gap",
         }
     }
 }
@@ -536,6 +672,47 @@ mod tests {
         assert!(Vec2::from_hyprland_str("3").is_err());
         assert!(Vec2::from_hyprland_str("3 4 5").is_err());
         assert!(Vec2::from_hyprland_str("a b").is_err());
+    }
+
+    #[test]
+    fn css_gap_expands_shorthand_like_css() {
+        let g = |s: &str| CssGap::from_hyprland_str(s).unwrap().sides();
+        assert_eq!(g("5"), [5, 5, 5, 5]);
+        assert_eq!(g("5 10"), [5, 10, 5, 10]);
+        assert_eq!(g("5 10 15"), [5, 10, 15, 10]);
+        assert_eq!(g("5 10 15 20"), [5, 10, 15, 20]);
+        assert_eq!(g("5, 10"), [5, 10, 5, 10]);
+        assert_eq!(g("2.6"), [3, 3, 3, 3]);
+    }
+
+    #[test]
+    fn css_gap_renders_the_shortest_equivalent() {
+        for (input, canonical) in [
+            ("5", "5"),
+            ("5 5 5 5", "5"),
+            ("5 10 5 10", "5 10"),
+            ("5 10 15 10", "5 10 15"),
+            ("5 10 15 20", "5 10 15 20"),
+        ] {
+            let gap = CssGap::from_hyprland_str(input).unwrap();
+            assert_eq!(gap.to_hyprland_string(), canonical, "{input}");
+            assert_eq!(CssGap::from_hyprland_str(canonical).unwrap(), gap);
+        }
+    }
+
+    #[test]
+    fn css_gap_rejects_garbage() {
+        assert!(CssGap::from_hyprland_str("").is_err());
+        assert!(CssGap::from_hyprland_str("1 2 3 4 5").is_err());
+        assert!(CssGap::from_hyprland_str("wide").is_err());
+    }
+
+    #[test]
+    fn css_gap_side_edits_keep_the_rest() {
+        let gap = CssGap::uniform(4).with_side(1, 9);
+        assert_eq!(gap.sides(), [4, 9, 4, 4]);
+        assert!(!gap.is_uniform());
+        assert!(CssGap::uniform(3).is_uniform());
     }
 
     #[test]

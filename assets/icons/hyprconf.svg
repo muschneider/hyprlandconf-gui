@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+<!--
+  hyprconf application icon.
+
+  Three sliders on a Catppuccin Mocha plate: "settings" is the one metaphor that
+  survives being drawn at 16x16, and the cyan -> mauve run of the knobs is the
+  palette the app itself ships with by default.
+
+  This file is the *source*. The rasters under `hicolor/` are generated from it;
+  see the `icons` note in `mise.toml`.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="hyprconf">
+  <defs>
+    <!-- Plate: Catppuccin Mocha surface -> base, lit from the top-left. Kept a
+         notch lighter than the app background so the icon still has an edge
+         when it lands on a dark panel or dock. -->
+    <linearGradient id="plate" x1="0" y1="0" x2="0.85" y2="1">
+      <stop offset="0" stop-color="#494b63"/>
+      <stop offset="0.5" stop-color="#2a2b3d"/>
+      <stop offset="1" stop-color="#181825"/>
+    </linearGradient>
+
+    <!-- Cyan bloom behind the sliders, so the plate is not flat black. -->
+    <radialGradient id="bloom" cx="0.5" cy="0.42" r="0.62">
+      <stop offset="0" stop-color="#89dceb" stop-opacity="0.20"/>
+      <stop offset="1" stop-color="#89dceb" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Rim light along the top edge of the plate. -->
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#89dceb" stop-opacity="0.55"/>
+      <stop offset="0.5" stop-color="#89b4fa" stop-opacity="0.14"/>
+      <stop offset="1" stop-color="#cba6f7" stop-opacity="0.22"/>
+    </linearGradient>
+
+    <!-- Filled part of each track, one hue per row. These are painted onto
+         horizontal lines, whose bounding box has zero height — objectBoundingBox
+         units would be degenerate there (and the spec says: do not render), so
+         the track gradients are pinned to user space instead. -->
+    <linearGradient id="fill1" gradientUnits="userSpaceOnUse" x1="56" y1="0" x2="172" y2="0">
+      <stop offset="0" stop-color="#a6e3a1"/>
+      <stop offset="0.55" stop-color="#94e2d5"/>
+      <stop offset="1" stop-color="#89dceb"/>
+    </linearGradient>
+    <linearGradient id="fill2" gradientUnits="userSpaceOnUse" x1="56" y1="0" x2="96" y2="0">
+      <stop offset="0" stop-color="#89dceb"/>
+      <stop offset="1" stop-color="#74c7ec"/>
+    </linearGradient>
+    <linearGradient id="fill3" gradientUnits="userSpaceOnUse" x1="56" y1="0" x2="140" y2="0">
+      <stop offset="0" stop-color="#74c7ec"/>
+      <stop offset="0.5" stop-color="#89b4fa"/>
+      <stop offset="1" stop-color="#cba6f7"/>
+    </linearGradient>
+
+    <!-- Knobs: same hue as their row, brightened so they read as the handle. -->
+    <linearGradient id="knob1" x1="0" y1="0" x2="0.4" y2="1">
+      <stop offset="0" stop-color="#c9f3ec"/>
+      <stop offset="1" stop-color="#89dceb"/>
+    </linearGradient>
+    <linearGradient id="knob2" x1="0" y1="0" x2="0.4" y2="1">
+      <stop offset="0" stop-color="#b6e9f7"/>
+      <stop offset="1" stop-color="#74c7ec"/>
+    </linearGradient>
+    <linearGradient id="knob3" x1="0" y1="0" x2="0.4" y2="1">
+      <stop offset="0" stop-color="#dcc7fb"/>
+      <stop offset="1" stop-color="#cba6f7"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Plate -->
+  <rect x="12" y="12" width="232" height="232" rx="54" fill="url(#plate)"/>
+  <rect x="12" y="12" width="232" height="232" rx="54" fill="url(#bloom)"/>
+  <rect x="14" y="14" width="228" height="228" rx="52" fill="none" stroke="url(#rim)" stroke-width="4"/>
+
+  <!-- Sliders. Track 56..200; knob centres stay inside 70..186 so the handle
+       never overhangs the rounded cap. -->
+  <g stroke-linecap="round" stroke-width="16" fill="none">
+    <!-- row 1 -->
+    <path d="M56 86 H200" stroke="#585b70"/>
+    <path d="M56 86 H172" stroke="url(#fill1)"/>
+    <!-- row 2 -->
+    <path d="M56 128 H200" stroke="#585b70"/>
+    <path d="M56 128 H96" stroke="url(#fill2)"/>
+    <!-- row 3 -->
+    <path d="M56 170 H200" stroke="#585b70"/>
+    <path d="M56 170 H140" stroke="url(#fill3)"/>
+  </g>
+
+  <g stroke="#11111b" stroke-width="5">
+    <circle cx="172" cy="86" r="17" fill="url(#knob1)"/>
+    <circle cx="96" cy="128" r="17" fill="url(#knob2)"/>
+    <circle cx="140" cy="170" r="17" fill="url(#knob3)"/>
+  </g>
+</svg>

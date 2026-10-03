@@ -33,3 +33,15 @@ fmt-check:
 
 # The full local gate, mirroring CI: format check + clippy + tests.
 ci: fmt-check lint test
+
+# Render the main screens headlessly to PNGs (no window, no compositor).
+# `just shots` uses a built-in demo config; `just shots ~/.config/hypr/hyprland.lua`
+# renders yours (read-only). Output: /tmp/hyprconf-shots
+shots CONFIG="":
+    HYPRCONF_SHOTS=/tmp/hyprconf-shots HYPRCONF_SHOT_CONFIG="{{CONFIG}}" \
+        cargo test -p hyprconf-gui screenshots -- --ignored
+
+# Refresh the vendored option descriptions + slider hints from the running
+# Hyprland (then run `just test`: coverage/enum/default drift fails loudly).
+refresh-descriptions:
+    hyprctl descriptions -j | python3 meta/gen_sliders.py --vendor

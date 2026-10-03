@@ -13,6 +13,8 @@ thiserror.workspace = true
 indexmap.workspace = true
 glob.workspace = true
 full_moon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

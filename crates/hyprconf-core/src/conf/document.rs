@@ -239,7 +239,10 @@ impl ConfDocument {
     /// inserting it into the right place otherwise.
     ///
     /// Editing rewrites only the target line; indentation, the `=` spacing and
-    /// any inline comment are preserved.
+    /// any inline comment are preserved. `full_path` may be given in either
+    /// spelling (`tap_to_click` / `tap-to-click`); an existing line is found
+    /// under either, and a new one is always written in the `.conf` spelling
+    /// Hyprland requires.
     pub fn set_option(&mut self, full_path: &str, value: &str) -> SetOutcome {
         if let Some(idx) = self.find_assignment(full_path) {
             if let LineKind::Assignment(a) = &mut self.lines[idx].kind {
@@ -248,7 +251,15 @@ impl ConfDocument {
             }
             return SetOutcome::Edited;
         }
-        self.insert_option(full_path, value)
+        let conf = crate::schema::conf_path(full_path).into_owned();
+        self.insert_option(&conf, value)
+    }
+
+    /// Whether any assignment in this document sets `full_path` (in either
+    /// spelling).
+    #[must_use]
+    pub fn defines(&self, full_path: &str) -> bool {
+        self.find_assignment(full_path).is_some()
     }
 
     /// Like [`ConfDocument::set_option`] but renders a typed [`Value`].
@@ -258,14 +269,20 @@ impl ConfDocument {
     }
 
     /// The index of the last assignment line matching `full_path` (last write
-    /// wins, mirroring hyprlang evaluation).
+    /// wins, mirroring hyprlang evaluation), comparing canonical spellings.
     fn find_assignment(&self, full_path: &str) -> Option<usize> {
+        let wanted = crate::schema::canonical_path(full_path);
         self.lines
             .iter()
             .enumerate()
             .rev()
             .find_map(|(i, l)| match &l.kind {
-                LineKind::Assignment(a) if a.full_path == full_path => Some(i),
+                LineKind::Assignment(a)
+                    if a.full_path == full_path
+                        || crate::schema::canonical_path(&a.full_path) == wanted =>
+                {
+                    Some(i)
+                }
                 _ => None,
             })
     }

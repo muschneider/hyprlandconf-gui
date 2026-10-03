@@ -23,16 +23,21 @@ pub mod fs;
 pub mod hyprctl;
 pub mod lua;
 pub mod model;
+pub mod outputs;
 pub mod schema;
 pub mod structured;
 pub mod validate;
 pub mod value;
+pub mod verify;
 
 pub use conf::{ConfBundle, ConfDocument, ConfError, ConfParser, ConfSerializer, ConfWarning};
 pub use fs::{atomic_write, backup_existing, save_atomically, FsError, SaveReport};
 pub use hyprctl::{HyprctlError, HyprlandInfo};
-pub use lua::{LuaBundle, LuaDocument, LuaError, LuaParser, LuaSerializer, LuaWarning};
+pub use lua::{
+    LuaBundle, LuaDocument, LuaError, LuaNote, LuaOutput, LuaParser, LuaSerializer, LuaWarning,
+};
 pub use model::{Config, ConfigFormat, Provenance, Span, Tracked};
+pub use outputs::{DetectedMonitor, Mode};
 pub use schema::{
     CollectionId, CollectionSpec, EnumVariant, NumericRange, OptionSpec, Schema, Section, ValueType,
 };
@@ -42,6 +47,7 @@ pub use structured::{
 };
 pub use validate::{has_errors, unsupported_options, validate_config, ConfigProblem, Severity};
 pub use value::{Color, Gradient, Value, ValueParseError, Vec2};
+pub use verify::{verify_file, verify_text, Verdict, VerifyIssue};
 
 /// The error type returned by fallible `hyprconf-core` operations.
 ///

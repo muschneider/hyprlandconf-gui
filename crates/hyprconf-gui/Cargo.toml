@@ -26,5 +26,9 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[dev-dependencies]
+# Headless rendering of the real `view()` to PNG (see `ui_tests::screenshots`).
+iced_test = "0.14"
+
 [lints]
 workspace = true

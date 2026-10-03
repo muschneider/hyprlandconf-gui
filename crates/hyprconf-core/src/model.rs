@@ -18,8 +18,8 @@ use indexmap::IndexMap;
 
 use crate::schema::Schema;
 use crate::structured::{
-    Animation, Bezier, EnvVar, Exec, Keybind, LayerRule, MonitorRule, Submap, Variable, WindowRule,
-    WorkspaceRule,
+    Animation, Bezier, Device, EnvVar, Exec, Gesture, Keybind, LayerRule, MonitorRule, Permission,
+    Plugin, Submap, Variable, WindowRule, WorkspaceRule,
 };
 use crate::value::Value;
 
@@ -138,6 +138,14 @@ pub struct Config {
     pub beziers: Vec<Tracked<Bezier>>,
     /// `animation` directives, in order.
     pub animations: Vec<Tracked<Animation>>,
+    /// `gesture` bindings, in order (later ones may be shadowed by earlier).
+    pub gestures: Vec<Tracked<Gesture>>,
+    /// `device { … }` blocks, in order.
+    pub devices: Vec<Tracked<Device>>,
+    /// `permission` rules, in order (first match wins).
+    pub permissions: Vec<Tracked<Permission>>,
+    /// `plugin` loads, in order.
+    pub plugins: Vec<Tracked<Plugin>>,
 }
 
 impl Config {
@@ -245,9 +253,10 @@ mod tests {
         let config = Config::default_from_schema(&schema);
 
         assert_eq!(config.get("decoration:rounding"), Some(&Value::Int(0)));
+        // An open choice (custom `lua:<name>` layouts are valid), so a string.
         assert_eq!(
             config.get("general:layout"),
-            Some(&Value::Enum("dwindle".into()))
+            Some(&Value::String("dwindle".into()))
         );
         assert_eq!(
             config.get("general:col.active_border"),

@@ -24,6 +24,7 @@ mod serializer;
 pub use document::{
     Assignment, ConfDocument, Directive, Line, LineEnding, LineKind, SetOutcome, Source,
 };
+pub(crate) use mapper::bool_as_mode;
 pub use mapper::{bundle_to_config, document_to_config, ConfWarning};
 pub use parser::{ConfBundle, ConfError, ConfParser};
 pub use serializer::{config_to_conf, value_to_conf, ConfSerializer};

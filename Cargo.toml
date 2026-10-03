@@ -14,8 +14,9 @@ authors = ["hyprconf contributors"]
 # Internal crates
 hyprconf-core = { path = "crates/hyprconf-core", version = "1.0.0" }
 
-# GUI (canvas: the 2D color-picker area + hue strip)
-iced = { version = "0.14", features = ["canvas"] }
+# GUI. `canvas` draws the 2D colour-picker area and hue strip; `advanced`
+# exposes the widget-operation API used to focus the search field (Ctrl+F).
+iced = { version = "0.14", features = ["canvas", "advanced"] }
 
 # Data structures
 indexmap = "2"
@@ -26,6 +27,9 @@ directories = "6"
 # Settings persistence
 serde = { version = "1", features = ["derive"] }
 toml = "1"
+
+# `hyprctl ... -j` output (output/monitor detection)
+serde_json = "1"
 
 # Filesystem
 glob = "0.3"

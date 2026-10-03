@@ -14,7 +14,9 @@
 //! file's `README.md` for provenance and the regeneration procedure.
 
 mod data;
+mod sliders;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -44,6 +46,8 @@ pub enum ValueType {
     Enum(Vec<EnumVariant>),
     /// A 2D vector.
     Vec2,
+    /// Per-side gaps in CSS shorthand (`5`, `5 10`, `5 10 15 20`).
+    CssGap,
 
     // ---- structured kinds (back ordered collections) ----
     /// A key/mouse binding.
@@ -68,6 +72,14 @@ pub enum ValueType {
     Submap,
     /// A hyprlang `$variable`.
     Variable,
+    /// A touchpad/touchscreen gesture binding.
+    Gesture,
+    /// A per-device input override block.
+    Device,
+    /// A permission rule (screencopy, plugin, keyboard, ...).
+    Permission,
+    /// A plugin to load.
+    Plugin,
 }
 
 impl ValueType {
@@ -84,6 +96,7 @@ impl ValueType {
                 | ValueType::String
                 | ValueType::Enum(_)
                 | ValueType::Vec2
+                | ValueType::CssGap
         )
     }
 
@@ -188,7 +201,21 @@ pub struct OptionSpec {
     /// The Hyprland default value.
     pub default: Value,
     /// An optional numeric range (for [`ValueType::Int`]/[`ValueType::Float`]).
+    ///
+    /// This is a **hard** limit: values outside it fail validation.
     pub range: Option<NumericRange>,
+    /// The span a UI slider should cover, as `(min, max)`.
+    ///
+    /// Unlike [`OptionSpec::range`] this is only a *hint*: Hyprland's own option
+    /// descriptions publish e.g. `0..=20` for `decoration:rounding`, yet happily
+    /// accept `30`. A value outside the hint is valid; the slider just pins to
+    /// its end while the number field shows the real value.
+    pub slider: Option<(f64, f64)>,
+    /// Suggested values for a free-form [`ValueType::String`] option — an
+    /// *open* choice. `general:layout` is the canonical example: the built-in
+    /// layouts are offered as a list, but `lua:<name>` custom layouts are just
+    /// as valid, so a strict [`ValueType::Enum`] would wrongly reject them.
+    pub suggestions: Vec<EnumVariant>,
     /// The Hyprland version that introduced the option, if known.
     pub since: Option<String>,
 }
@@ -199,6 +226,29 @@ impl OptionSpec {
     pub fn since(mut self, version: impl Into<String>) -> Self {
         self.since = Some(version.into());
         self
+    }
+
+    /// Builder helper: attach a UI slider span (see [`OptionSpec::slider`]).
+    #[must_use]
+    pub fn slider(mut self, min: f64, max: f64) -> Self {
+        self.slider = Some((min, max));
+        self
+    }
+
+    /// The span a slider for this option should cover: the explicit hint, else
+    /// a fully bounded hard [`OptionSpec::range`], else `None` (no slider).
+    #[must_use]
+    pub fn slider_span(&self) -> Option<(f64, f64)> {
+        self.slider.or_else(|| {
+            let range = self.range?;
+            Some((range.min?, range.max?))
+        })
+    }
+
+    /// The `.conf` spelling of this option's path (see [`conf_path`]).
+    #[must_use]
+    pub fn conf_path(&self) -> Cow<'_, str> {
+        conf_path(&self.path)
     }
 
     /// The enum variants, if this option is enumerated.
@@ -230,6 +280,12 @@ impl OptionSpec {
             (ValueType::Gradient, Value::Gradient(_)) => Ok(()),
             (ValueType::String, Value::String(_)) => Ok(()),
             (ValueType::Vec2, Value::Vec2(_)) => Ok(()),
+            (ValueType::CssGap, Value::CssGap(gap)) => {
+                for side in gap.sides() {
+                    self.check_range(side as f64)?;
+                }
+                Ok(())
+            }
             (ValueType::Enum(variants), Value::Enum(name)) => {
                 if variants.iter().any(|v| &v.name == name) {
                     Ok(())
@@ -317,6 +373,66 @@ pub enum CollectionId {
     Beziers,
     /// `animation = ...`
     Animations,
+    /// `gesture = ...` / `hl.gesture(...)`
+    Gestures,
+    /// `device { ... }` / `hl.device(...)`
+    Devices,
+    /// `permission = ...` / `hl.permission(...)`
+    Permissions,
+    /// `plugin = ...` / `hl.plugin.load(...)`
+    Plugins,
+}
+
+/// `.conf` spellings that differ from the canonical key.
+///
+/// hyprconf keys options by their **canonical** path — the Lua/stub spelling
+/// with `:` separators — because that is the one spelling the vendored stub can
+/// verify. A few options are spelled differently in hyprlang, and Hyprland is
+/// strict about it in both directions: `.conf` rejects `tap_to_click`
+/// (*"config option <input:touchpad:tap_to_click> does not exist"*) while Lua
+/// rejects `tap-to-click`. Every reader canonicalises through [`canonical_path`]
+/// and every `.conf` writer goes back through [`conf_path`].
+const CONF_SPELLINGS: &[(&str, &str)] = &[
+    // (canonical segment, conf segment)
+    ("input_capture", "input-capture"),
+    ("tap_to_click", "tap-to-click"),
+    ("tap_and_drag", "tap-and-drag"),
+];
+
+/// Map a path (or single key) as written in a `.conf` file to its canonical
+/// spelling. Paths without an alternative spelling are returned unchanged.
+#[must_use]
+pub fn canonical_path(path: &str) -> Cow<'_, str> {
+    respell(path, |(canonical, conf)| (conf, canonical))
+}
+
+/// Map a canonical path (or single key) to the spelling `.conf` files require.
+#[must_use]
+pub fn conf_path(path: &str) -> Cow<'_, str> {
+    respell(path, |(canonical, conf)| (canonical, conf))
+}
+
+fn respell<'a>(
+    path: &'a str,
+    pick: impl Fn((&'static str, &'static str)) -> (&'static str, &'static str),
+) -> Cow<'a, str> {
+    if !CONF_SPELLINGS
+        .iter()
+        .any(|&pair| path.contains(pick(pair).0))
+    {
+        return Cow::Borrowed(path);
+    }
+    let segments: Vec<&str> = path
+        .split(':')
+        .map(|segment| {
+            CONF_SPELLINGS
+                .iter()
+                .map(|&pair| pick(pair))
+                .find(|(from, _)| *from == segment)
+                .map_or(segment, |(_, to)| to)
+        })
+        .collect();
+    Cow::Owned(segments.join(":"))
 }
 
 /// Describes one structured collection (its element type and source keywords).
@@ -515,6 +631,10 @@ mod tests {
         CollectionId::Variables,
         CollectionId::Beziers,
         CollectionId::Animations,
+        CollectionId::Gestures,
+        CollectionId::Devices,
+        CollectionId::Permissions,
+        CollectionId::Plugins,
     ];
 
     #[test]
@@ -617,6 +737,170 @@ mod tests {
                 opt.path
             );
         }
+    }
+
+    /// Hyprland's own option descriptions (`hyprctl descriptions -j`), vendored
+    /// in `meta/` — the compositor's word on what exists and how it behaves.
+    fn descriptions() -> Vec<(String, serde_json::Value)> {
+        let all: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../../../meta/hyprland-descriptions.json"))
+                .expect("vendored descriptions must parse");
+        all.into_iter()
+            .map(|d| {
+                let name = d["name"].as_str().expect("every entry has a name");
+                (canonical_path(name).into_owned(), d)
+            })
+            .collect()
+    }
+
+    /// The completeness guarantee: every option the running compositor knows
+    /// about is editable here, and nothing here is unknown to it.
+    #[test]
+    fn schema_covers_every_option_the_compositor_describes() {
+        let schema = Schema::load();
+        let described: std::collections::HashSet<String> =
+            descriptions().into_iter().map(|(path, _)| path).collect();
+
+        let mut missing: Vec<&String> = described
+            .iter()
+            .filter(|p| schema.option(p).is_none())
+            .collect();
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "Hyprland describes options the schema lacks: {missing:?}"
+        );
+
+        let unknown: Vec<&str> = schema
+            .options()
+            .map(|o| o.path.as_str())
+            .filter(|p| !described.contains(*p))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "schema options Hyprland does not describe: {unknown:?}"
+        );
+    }
+
+    /// Where the compositor publishes a value map (`0 = disabled, 1 = ...`),
+    /// the option must be a dropdown over exactly those values.
+    #[test]
+    fn enums_match_the_compositors_value_maps() {
+        let schema = Schema::load();
+        for (path, d) in descriptions() {
+            let Some(map) = d.get("map").and_then(|m| m.as_array()) else {
+                continue;
+            };
+            let opt = schema.option(&path).expect("covered by the coverage test");
+            let variants = opt.enum_variants().unwrap_or_else(|| {
+                panic!("`{path}` has a value map in Hyprland but is not an enum")
+            });
+            let mut want: Vec<String> = map
+                .iter()
+                .filter_map(|m| m.as_object())
+                .flat_map(|m| m.values().map(ToString::to_string))
+                .collect();
+            want.sort();
+            let mut got: Vec<String> = variants
+                .iter()
+                .map(|v| v.name.clone())
+                .filter(|n| !n.is_empty())
+                .collect();
+            got.sort();
+            assert_eq!(got, want, "variants of `{path}`");
+        }
+    }
+
+    /// Schema defaults are what the compositor itself reports.
+    #[test]
+    fn defaults_match_the_compositor() {
+        use serde_json::Value as J;
+
+        // "Unset" sentinels with no faithful typed equivalent: `[[Auto]]`, and
+        // `-1` meaning "fall back to the active text colour".
+        const SENTINELS: &[&str] = &[
+            "input:touchdevice:output",
+            "group:groupbar:text_color_inactive",
+            "group:groupbar:text_color_locked_active",
+            "group:groupbar:text_color_locked_inactive",
+        ];
+        let argb =
+            |c: &crate::value::Color| format!("{:02x}{:02x}{:02x}{:02x}", c.a, c.r, c.g, c.b);
+        let text = |s: &str| {
+            if s == "[[EMPTY]]" {
+                String::new()
+            } else {
+                s.to_string()
+            }
+        };
+
+        let schema = Schema::load();
+        let mut wrong = Vec::new();
+        for (path, d) in descriptions() {
+            if SENTINELS.contains(&path.as_str()) {
+                continue;
+            }
+            let opt = schema.option(&path).expect("covered by the coverage test");
+            let want = &d["default"];
+            let ok = match (&opt.default, want) {
+                (Value::Bool(b), J::Bool(w)) => b == w,
+                (Value::Int(i), J::Number(n)) => n.as_f64() == Some(*i as f64),
+                (Value::Float(x), J::Number(n)) => n.as_f64().is_some_and(|n| (n - x).abs() < 1e-3),
+                (Value::Enum(e), J::Number(n)) => *e == n.to_string(),
+                (Value::Enum(e) | Value::String(e), J::String(w)) => *e == text(w),
+                (Value::Color(c), J::String(w)) => argb(c) == *w,
+                (Value::Gradient(g), J::String(w)) => {
+                    let mut tokens: Vec<&str> = w.split_whitespace().collect();
+                    let angle = tokens
+                        .pop()
+                        .and_then(|t| t.strip_suffix("deg"))
+                        .and_then(|t| t.parse::<f64>().ok());
+                    tokens == g.stops.iter().map(argb).collect::<Vec<_>>()
+                        && angle == Some(g.angle_deg.unwrap_or(0.0))
+                }
+                (Value::Vec2(v), J::Array(a)) => {
+                    a.len() == 2 && a[0].as_f64() == Some(v.x) && a[1].as_f64() == Some(v.y)
+                }
+                (Value::CssGap(gap), J::String(w)) => {
+                    crate::value::CssGap::from_hyprland_str(w).is_ok_and(|w| w == *gap)
+                }
+                _ => false,
+            };
+            if !ok {
+                wrong.push(format!(
+                    "{path}: schema {:?} vs Hyprland {want}",
+                    opt.default
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "defaults differ:\n{}", wrong.join("\n"));
+    }
+
+    #[test]
+    fn conf_spellings_round_trip() {
+        assert_eq!(
+            conf_path("input:touchpad:tap_to_click"),
+            "input:touchpad:tap-to-click"
+        );
+        assert_eq!(
+            canonical_path("input:touchpad:tap-and-drag"),
+            "input:touchpad:tap_and_drag"
+        );
+        assert_eq!(
+            conf_path("input_capture:capture_modifiers"),
+            "input-capture:capture_modifiers"
+        );
+        assert_eq!(
+            canonical_path("input-capture:enforce_barriers"),
+            "input_capture:enforce_barriers"
+        );
+        // Device fields use the same spellings as their `input:` counterparts.
+        assert_eq!(conf_path("tap_to_click"), "tap-to-click");
+        // Everything else passes through untouched (and unallocated).
+        assert!(matches!(
+            conf_path("decoration:rounding"),
+            Cow::Borrowed("decoration:rounding")
+        ));
     }
 
     /// Choice-typed options must expose their full list of variants (so the GUI

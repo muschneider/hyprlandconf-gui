@@ -4,53 +4,71 @@
 //! # Provenance
 //!
 //! - **Option *keys*** are taken verbatim from the vendored upstream stub
-//!   `meta/hyprland-config-keys.txt` (Hyprland 0.55.2 `HL.ConfigKey`). The
+//!   `meta/hyprland-config-keys.txt` (Hyprland 0.56 `HL.ConfigKey`). The
 //!   `schema::tests::every_option_path_exists_in_vendored_stub` test enforces
 //!   that every path below maps (via `:` -> `.`) to a real stub key.
-//! - **Types, defaults, ranges and descriptions** are taken from the
-//!   [Hyprland wiki — Configuring/Variables](https://wiki.hyprland.org/Configuring/Variables/).
-//!   Defaults drift between releases; treat them as best-effort and verify with
-//!   `hyprctl getoption <name>` on the target version when accuracy is critical.
-//! - **`since` hints** are intentionally left `None` for now: the stub carries
-//!   no version metadata, so populating them reliably needs a separate wiki
-//!   scrape (tracked for a later step).
+//! - **Coverage, value maps and defaults** are pinned to the compositor's own
+//!   `hyprctl descriptions -j` (`meta/hyprland-descriptions.json`) by three
+//!   tests in `schema.rs`; its `min`/`max` become slider hints (`sliders.rs`).
+//! - **Types, labels and variant explanations** are written by hand, from the
+//!   [Hyprland wiki](https://wiki.hypr.land/Configuring/) and the stub's
+//!   value types.
+//! - **`since` hints** are set only where the version is known for sure.
 //!
-//! This is a curated, representative subset — broad enough to exercise every
-//! section and value kind — not yet the full 341-key surface. Extending it is
-//! purely additive: append rows here and the cross-check test keeps them honest.
+//! This covers **every** option Hyprland 0.56 describes (353). A new release's
+//! additions show up as a failing coverage test after re-vendoring `meta/`.
 
 use super::{
-    CollectionId, CollectionSpec, EnumVariant, NumericRange, OptionSpec, Schema, Section, ValueType,
+    canonical_path, sliders::SLIDERS, CollectionId, CollectionSpec, EnumVariant, NumericRange,
+    OptionSpec, Schema, Section, ValueType,
 };
-use crate::value::{Color, Gradient, Value, Vec2};
+use crate::value::{Color, CssGap, Gradient, Value, Vec2};
 
 /// Build the full embedded schema.
 pub(super) fn build() -> Schema {
-    Schema::from_parts(
-        vec![
-            general(),
-            decoration(),
-            animations(),
-            input(),
-            gestures(),
-            group(),
-            misc(),
-            binds(),
-            layout(),
-            dwindle(),
-            master(),
-            scrolling(),
-            xwayland(),
-            cursor(),
-            opengl(),
-            render(),
-            ecosystem(),
-            debug(),
-            experimental(),
-            quirks(),
-        ],
-        collections(),
-    )
+    let mut sections = vec![
+        general(),
+        decoration(),
+        animations(),
+        input(),
+        input_capture(),
+        gestures(),
+        group(),
+        misc(),
+        binds(),
+        layout(),
+        dwindle(),
+        master(),
+        scrolling(),
+        xwayland(),
+        cursor(),
+        opengl(),
+        render(),
+        ecosystem(),
+        debug(),
+        experimental(),
+        quirks(),
+    ];
+    apply_slider_hints(&mut sections);
+    Schema::from_parts(sections, collections())
+}
+
+/// Attach Hyprland's published `min`/`max` (see `sliders.rs`) as slider hints
+/// to numeric options that don't already carry an explicit one.
+fn apply_slider_hints(sections: &mut [Section]) {
+    for (path, min, max) in SLIDERS {
+        let path = canonical_path(path);
+        let Some(opt) = sections
+            .iter_mut()
+            .flat_map(|s| s.options.iter_mut())
+            .find(|o| o.path == path)
+        else {
+            continue;
+        };
+        if matches!(opt.value_type, ValueType::Int | ValueType::Float) && opt.slider.is_none() {
+            opt.slider = Some((*min, *max));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -80,9 +98,59 @@ fn spec(
         value_type,
         default,
         range: None,
+        slider: None,
+        suggestions: Vec::new(),
         since: None,
     }
 }
+
+/// A free-form string offered with a list of suggested values (an *open*
+/// choice — see [`OptionSpec::suggestions`]).
+fn sg(
+    path: &str,
+    label: &str,
+    description: &str,
+    default: &str,
+    suggestions: &[(&str, &str)],
+) -> OptionSpec {
+    let mut o = s(path, label, description, default);
+    o.suggestions = suggestions
+        .iter()
+        .map(|(name, desc)| EnumVariant::described(*name, *desc))
+        .collect();
+    o
+}
+
+/// A CSS-style gap option (one to four sides), never negative.
+fn gap(path: &str, label: &str, description: &str, default: i64, slider_max: f64) -> OptionSpec {
+    let mut o = spec(
+        path,
+        label,
+        description,
+        ValueType::CssGap,
+        Value::CssGap(CssGap::uniform(default)),
+    );
+    o.range = Some(NumericRange::at_least(0.0));
+    o.slider = Some((0.0, slider_max));
+    o
+}
+
+/// The CSS font weights Hyprland accepts, by number (what it stores) with the
+/// conventional name as the explanation.
+const FONT_WEIGHTS: &[(&str, &str)] = &[
+    ("100", "Thin"),
+    ("200", "Ultra-light"),
+    ("300", "Light"),
+    ("350", "Semi-light"),
+    ("380", "Book"),
+    ("400", "Normal"),
+    ("500", "Medium"),
+    ("600", "Semi-bold"),
+    ("700", "Bold"),
+    ("800", "Ultra-bold"),
+    ("900", "Heavy"),
+    ("1000", "Ultra-heavy"),
+];
 
 fn b(path: &str, label: &str, description: &str, default: bool) -> OptionSpec {
     spec(
@@ -214,12 +282,12 @@ fn general() -> Section {
         "Core layout, gaps and border behaviour.",
         vec![
             i("general:border_size", "Border size", "Window border thickness in px.", 1, NumericRange::at_least(0.0)),
-            i("general:gaps_in", "Inner gaps", "Gaps between adjacent windows.", 5, NumericRange::at_least(0.0)),
-            i("general:gaps_out", "Outer gaps", "Gaps between windows and screen edges.", 20, NumericRange::at_least(0.0)),
+            gap("general:gaps_in", "Inner gaps", "Gaps between adjacent windows. One value for every side, or top/right/bottom/left individually.", 5, 50.0),
+            gap("general:gaps_out", "Outer gaps", "Gaps between windows and the screen edges. One value for every side, or top/right/bottom/left individually.", 20, 80.0),
             i("general:gaps_workspaces", "Workspace gaps", "Gaps between workspaces while swiping.", 0, NumericRange::at_least(0.0)),
             g("general:col.active_border", "Active border color", "Border color of the focused window.", solid(argb(0xffffffff))),
             g("general:col.inactive_border", "Inactive border color", "Border color of unfocused windows.", solid(argb(0xff444444))),
-            e("general:layout", "Layout", "The tiling layout engine.", "dwindle", &[
+            sg("general:layout", "Layout", "The tiling layout engine. A custom layout registered with hl.layout.register is selected as lua:<name>.", "dwindle", &[
                 ("dwindle", "BSP-style binary tiling."),
                 ("master", "Master/stack tiling."),
                 ("scrolling", "PaperWM-style horizontal scrolling tiling."),
@@ -241,7 +309,7 @@ fn general() -> Section {
             i("general:snap:window_gap", "Snap window gap", "Distance at which floating windows snap to each other.", 10, NumericRange::at_least(0.0)).since("0.42.0"),
             i("general:snap:monitor_gap", "Snap monitor gap", "Distance at which floating windows snap to monitor edges.", 10, NumericRange::at_least(0.0)).since("0.42.0"),
             b("general:snap:border_overlap", "Snap border overlap", "Allow snapped borders to overlap.", false).since("0.42.0"),
-            i("general:float_gaps", "Float gaps", "Gaps between windows and monitor edges for floating windows.", 0, NumericRange::at_least(0.0)),
+            gap("general:float_gaps", "Float gaps", "Gaps between floating windows and the monitor edges. One value for every side, or top/right/bottom/left individually.", 0, 80.0),
             g("general:col.nogroup_border", "Nogroup border color", "Inactive border color for window that cannot be added to a group.", solid(argb(0xffffaaff))),
             g("general:col.nogroup_border_active", "Nogroup border active color", "Active border color for window that cannot be added to a group.", solid(argb(0xffff00ff))),
             b("general:snap:respect_gaps", "Snap respect gaps", "If true, snapping will respect gaps between windows.", false),
@@ -273,7 +341,7 @@ fn decoration() -> Section {
             b("decoration:blur:xray", "Blur xray", "Blur behind floating windows as if transparent.", false),
             fl("decoration:blur:noise", "Blur noise", "Noise added to the blur.", 0.0117, NumericRange::bounded(0.0, 1.0)),
             fl("decoration:blur:contrast", "Blur contrast", "Contrast of the blur.", 0.8916, NumericRange::bounded(0.0, 2.0)),
-            fl("decoration:blur:brightness", "Blur brightness", "Brightness of the blur.", 0.8172, NumericRange::bounded(0.0, 2.0)),
+            fl("decoration:blur:brightness", "Blur brightness", "Brightness of the blur.", 1.0, NumericRange::bounded(0.0, 2.0)),
             fl("decoration:blur:vibrancy", "Blur vibrancy", "Saturation boost of the blur.", 0.1696, NumericRange::bounded(0.0, 1.0)),
             fl("decoration:blur:vibrancy_darkness", "Blur vibrancy darkness", "Vibrancy effect on dark areas.", 0.0, NumericRange::bounded(0.0, 1.0)),
             b("decoration:blur:special", "Blur special", "Blur the special workspace background.", false),
@@ -281,16 +349,16 @@ fn decoration() -> Section {
             b("decoration:shadow:enabled", "Shadow enabled", "Enable drop shadows.", true),
             i("decoration:shadow:range", "Shadow range", "Shadow size/spread in px.", 4, NumericRange::at_least(0.0)),
             i("decoration:shadow:render_power", "Shadow render power", "Falloff steepness of the shadow.", 3, NumericRange::bounded(1.0, 4.0)),
-            c("decoration:shadow:color", "Shadow color", "Drop shadow color.", argb(0xee1a1a1a)),
+            g("decoration:shadow:color", "Shadow color", "Drop shadow color; alpha sets its opacity. Accepts a gradient.", solid(argb(0xee1a1a1a))),
             v("decoration:shadow:offset", "Shadow offset", "Shadow offset as an x/y vector.", Vec2::new(0.0, 0.0)),
             fl("decoration:shadow:scale", "Shadow scale", "Shadow scale factor.", 1.0, NumericRange::bounded(0.0, 1.0)),
             b("decoration:shadow:sharp", "Shadow sharp", "Render sharp (non-blurred) shadows.", false),
-            g("decoration:shadow:color_inactive", "Shadow color inactive", "Inactive shadow color. (if not set, will fall back to col.shadow).", solid(argb(0xee1a1a1a))),
+            g("decoration:shadow:color_inactive", "Shadow color inactive", "Shadow color for unfocused windows. While unset, the active shadow color is used.", solid(argb(0xffffffff))),
             b("decoration:glow:enabled", "Glow enabled", "Enable inner glow on windows.", false),
             i("decoration:glow:range", "Glow range", "Glow range (size) in layout px.", 10, NumericRange::bounded(0.0, 100.0)),
             i("decoration:glow:render_power", "Glow render power", "In what power to render the falloff (more power, the faster the falloff).", 3, NumericRange::bounded(1.0, 4.0)),
-            c("decoration:glow:color", "Glow color", "Glow's color. Alpha dictates glow's opacity.", argb(0xee33ccff)),
-            c("decoration:glow:color_inactive", "Glow color inactive", "Inactive glow color. (if not set, will fall back to decoration:glow:color).", argb(0x0033ccff)),
+            g("decoration:glow:color", "Glow color", "Glow color; alpha sets its opacity. Accepts a gradient.", solid(argb(0xee33ccff))),
+            g("decoration:glow:color_inactive", "Glow color inactive", "Glow color for unfocused windows. While unset, the active glow color is used.", solid(argb(0xffffffff))),
             b("decoration:dim_modal", "Dim modal", "Enables dimming of parents of modal windows.", true),
             fl("decoration:dim_special", "Dim special", "How much to dim the rest of the screen by when a special workspace is open.", 0.2, NumericRange::bounded(0.0, 1.0)),
             fl("decoration:dim_around", "Dim around", "How much the dimaround window rule should dim by.", 0.4, NumericRange::bounded(0.0, 1.0)),
@@ -385,7 +453,11 @@ fn input() -> Section {
                 ("lmr", "1/2/3 fingers map to left/middle/right."),
             ]),
             b("input:touchpad:tap_and_drag", "Tap and drag", "Enable tap-and-drag.", true),
-            b("input:touchpad:drag_lock", "Drag lock", "Keep dragging after lifting during tap-and-drag.", false),
+            e("input:touchpad:drag_lock", "Drag lock", "Whether lifting the finger mid-drag drops the dragged item.", "0", &[
+                ("0", "Disabled: lifting the finger drops the item."),
+                ("1", "Timeout: the drag survives a brief lift."),
+                ("2", "Sticky: the drag continues until the next tap."),
+            ]),
             s("input:kb_file", "Kb file", "Appropriate XKB keymap file.", ""),
             b("input:resolve_binds_by_sym", "Resolve binds by sym", "Determines how keybinds act when multiple layouts are used.", false),
             b("input:force_no_accel", "Force no accel", "Force no cursor acceleration.", false),
@@ -426,6 +498,19 @@ fn input() -> Section {
             i("input:tablettool:eraser_button_override", "Tablettool eraser button override", "Set a button to be button event when eraser_button_mode is set to 1. Has to be an int, cannot be a string. Must be a valid button (e.g. BTN_STYLUS).", 0, NumericRange::at_least(0.0)),
             fl("input:tablettool:pressure_range_min", "Tablettool pressure range min", "Set the minimum pressure range for the tool, a negative number will set the default minimum pressure value. This is usually 0.0.", -1.0, NumericRange::bounded(-1.0, 1.0)),
             fl("input:tablettool:pressure_range_max", "Tablettool pressure range max", "Set the maximum pressure range for the tool, a negative number will set the default maximum pressure value. This is usually 1.0.", -1.0, NumericRange::bounded(-1.0, 1.0)),
+        ],
+    )
+}
+
+#[rustfmt::skip]
+fn input_capture() -> Section {
+    sec(
+        "input_capture",
+        "Input capture",
+        "The input-capture portal protocol (remote input, KVM-style sharing). Spelled input-capture in .conf files.",
+        vec![
+            b("input_capture:capture_modifiers", "Capture modifiers", "Also capture modifier keys and send them to the capturing program.", false),
+            b("input_capture:enforce_barriers", "Enforce barriers", "Raise a Wayland protocol error when a client submits an invalid barrier.", true),
         ],
     )
 }
@@ -473,9 +558,10 @@ fn group() -> Section {
             b("group:merge_groups_on_drag", "Merge on drag", "Merge groups when dragged onto each other.", true),
             g("group:col.border_active", "Active group border", "Border of the active group.", solid(argb(0x66ffff00))),
             g("group:col.border_inactive", "Inactive group border", "Border of inactive groups.", solid(argb(0x66777700))),
-            g("group:col.border_locked_active", "Locked active border", "Border of the active locked group.", solid(argb(0x66ff5500))),
-            g("group:col.border_locked_inactive", "Locked inactive border", "Border of inactive locked groups.", solid(argb(0x66775500))),
+            g("group:col.border_locked_active", "Locked active border", "Border of the active locked group.", solid(argb(0x66775500))),
+            g("group:col.border_locked_inactive", "Locked inactive border", "Border of inactive locked groups.", solid(argb(0x66ff5500))),
             b("group:groupbar:enabled", "Groupbar enabled", "Render the group bar.", true),
+            b("group:groupbar:disable_when_only", "Groupbar disable when only", "Hide the group bar while the group holds a single window.", false),
             i("group:groupbar:font_size", "Groupbar font size", "Group bar title font size.", 8, NumericRange::at_least(1.0)),
             i("group:groupbar:height", "Groupbar height", "Group bar height in px.", 14, NumericRange::at_least(1.0)),
             b("group:groupbar:render_titles", "Render titles", "Show window titles in the group bar.", true),
@@ -485,36 +571,8 @@ fn group() -> Section {
             b("group:merge_floated_into_tiled_on_groupbar", "Merge floated into tiled on groupbar", "Whether dragging a floating window into a tiled window groupbar will merge them.", false),
             b("group:group_on_movetoworkspace", "Group on movetoworkspace", "Whether using movetoworkspace[silent] will merge the window into the workspace's solitary unlocked group.", false),
             s("group:groupbar:font_family", "Groupbar font family", "Font used to display groupbar titles.", ""),
-            e("group:groupbar:font_weight_active", "Groupbar font weight active", "Weight of the font used to display active groupbar titles.", "", &[
-                ("", "Inherit the font family's default weight."),
-                ("thin", "Thin (100)."),
-                ("ultralight", "Ultra-light (200)."),
-                ("light", "Light (300)."),
-                ("semilight", "Semi-light (350)."),
-                ("book", "Book (380)."),
-                ("normal", "Normal (400)."),
-                ("medium", "Medium (500)."),
-                ("semibold", "Semi-bold (600)."),
-                ("bold", "Bold (700)."),
-                ("ultrabold", "Ultra-bold (800)."),
-                ("heavy", "Heavy (900)."),
-                ("ultraheavy", "Ultra-heavy (1000)."),
-            ]),
-            e("group:groupbar:font_weight_inactive", "Groupbar font weight inactive", "Weight of the font used to display inactive groupbar titles.", "", &[
-                ("", "Inherit the font family's default weight."),
-                ("thin", "Thin (100)."),
-                ("ultralight", "Ultra-light (200)."),
-                ("light", "Light (300)."),
-                ("semilight", "Semi-light (350)."),
-                ("book", "Book (380)."),
-                ("normal", "Normal (400)."),
-                ("medium", "Medium (500)."),
-                ("semibold", "Semi-bold (600)."),
-                ("bold", "Bold (700)."),
-                ("ultrabold", "Ultra-bold (800)."),
-                ("heavy", "Heavy (900)."),
-                ("ultraheavy", "Ultra-heavy (1000)."),
-            ]),
+            sg("group:groupbar:font_weight_active", "Groupbar font weight active", "Weight of the active groupbar title font: a number (100-1000) or a name such as bold.", "400", FONT_WEIGHTS),
+            sg("group:groupbar:font_weight_inactive", "Groupbar font weight inactive", "Weight of the inactive groupbar title font: a number (100-1000) or a name such as bold.", "400", FONT_WEIGHTS),
             b("group:groupbar:gradients", "Groupbar gradients", "Enables gradients.", false),
             i("group:groupbar:indicator_gap", "Groupbar indicator gap", "Height of the gap between the groupbar indicator and title.", 0, NumericRange::bounded(0.0, 64.0)),
             i("group:groupbar:indicator_height", "Groupbar indicator height", "Height of the groupbar indicator.", 3, NumericRange::bounded(1.0, 64.0)),
@@ -572,7 +630,7 @@ fn misc() -> Section {
             b("misc:animate_manual_resizes", "Animate manual resizes", "Animate windows during manual resizes.", false),
             b("misc:animate_mouse_windowdragging", "Animate mouse dragging", "Animate windows during mouse dragging.", false),
             b("misc:focus_on_activate", "Focus on activate", "Focus windows that request activation.", false),
-            c("misc:col.splash", "Splash color", "Color of the splash text.", argb(0xffffffff)),
+            c("misc:col.splash", "Splash color", "Color of the splash text.", argb(0x55ffffff)),
             c("misc:background_color", "Background color", "Solid background color behind windows.", rgb(0x111111)),
             s("misc:font_family", "Font family", "Default font family for built-in text.", "Sans"),
             b("misc:enable_swallow", "Enable swallow", "Enable window swallowing.", false),
@@ -591,8 +649,14 @@ fn misc() -> Section {
             b("misc:mouse_move_focuses_monitor", "Mouse move focuses monitor", "Whether mouse moving into a different monitor should focus it.", true),
             b("misc:allow_session_lock_restore", "Allow session lock restore", "If true, will allow you to restart a lockscreen app in case it crashes.", false),
             b("misc:session_lock_xray", "Session lock xray", "Keep rendering workspaces below your lockscreen.", false),
+            b("misc:session_lock_blur", "Session lock blur", "Blur what is behind the lockscreen (pair it with session lock xray).", false),
             b("misc:exit_window_retains_fullscreen", "Exit window retains fullscreen", "If true, closing a fullscreen window makes the next focused window fullscreen.", false),
-            i("misc:initial_workspace_tracking", "Initial workspace tracking", "If enabled, windows will open on the workspace they were invoked on.", 1, NumericRange::bounded(0.0, 2.0)),
+            e("misc:initial_workspace_tracking", "Initial workspace tracking", "Open windows on the workspace they were launched from.", "1", &[
+                ("0", "Disabled."),
+                ("1", "Single-shot: only the first window of the launched app."),
+                ("2", "Persistent: every window of the launched app."),
+            ]),
+            i("misc:initial_workspace_token_timeout", "Initial workspace token timeout", "Seconds a launched app has to open its window before workspace tracking gives up.", 10, NumericRange::bounded(1.0, 3600.0)),
             i("misc:render_unfocused_fps", "Render unfocused fps", "The maximum limit for renderunfocused windows' fps in the background.", 15, NumericRange::bounded(1.0, 120.0)),
             b("misc:disable_xdg_env_checks", "Disable xdg env checks", "Disable the warning if XDG environment is externally managed.", false),
             b("misc:disable_hyprland_guiutils_check", "Disable hyprland guiutils check", "Disable the warning if hyprland-guiutils is missing.", false),
@@ -812,7 +876,12 @@ fn render() -> Section {
                 ("2", "Ondemand."),
                 ("3", "Ignore."),
             ]),
-            s("render:cm_sdr_eotf", "Cm sdr eotf", "Default transfer function for displaying SDR apps.", "default"),
+            sg("render:cm_sdr_eotf", "Cm sdr eotf", "Default transfer function for displaying SDR apps.", "default", &[
+                ("default", "Hyprland's default (gamma 2.2)."),
+                ("gamma22", "Gamma 2.2."),
+                ("gamma22force", "Gamma 2.2, even for apps that request sRGB."),
+                ("srgb", "The piecewise sRGB curve."),
+            ]),
             b("render:commit_timing_enabled", "Commit timing enabled", "Enable commit timing proto. Requires restart.", true),
             b("render:icc_vcgt_enabled", "Icc vcgt enabled", "Enable sending VCGT ramps to KMS with ICC profiles.", true),
             b("render:use_shader_blur_blend", "Use shader blur blend", "Use experimental blurred bg blending.", false),
@@ -957,7 +1026,7 @@ fn experimental() -> Section {
         "Experimental",
         "Experimental, unstable features. Use with caution.",
         vec![
-            b("experimental:wp_cm_1_2", "Wp cm 1 2", "Allow wp-cm-v1 version 2.", false),
+            b("experimental:wp_cm_1_2", "Wp cm 1 2", "Allow wp-cm-v1 version 2.", true),
         ],
     )
 }
@@ -1020,5 +1089,9 @@ fn collections() -> Vec<CollectionSpec> {
         collection(CollectionId::Variables, "Variables", "hyprlang `$variables` (textual macros).", ValueType::Variable, &[]),
         collection(CollectionId::Beziers, "Bezier curves", "Named bezier curves used by animations.", ValueType::Bezier, &["bezier"]),
         collection(CollectionId::Animations, "Animation rules", "Per-target animation settings.", ValueType::Animation, &["animation"]),
+        collection(CollectionId::Gestures, "Gesture bindings", "Touchpad swipes and pinches bound to actions (workspace, move, close, …).", ValueType::Gesture, &["gesture", "gesturep"]),
+        collection(CollectionId::Devices, "Devices", "Per-device input overrides (sensitivity, layout, …) by device name.", ValueType::Device, &["device"]),
+        collection(CollectionId::Permissions, "Permissions", "Which programs may capture the screen, load plugins or use input devices.", ValueType::Permission, &["permission"]),
+        collection(CollectionId::Plugins, "Plugins", "Plugin libraries loaded at startup.", ValueType::Plugin, &["plugin"]),
     ]
 }

@@ -7,30 +7,32 @@ use iced::widget::{
 };
 use iced::{Alignment, Border, Color, Element, Font, Length, Theme};
 
-use hyprconf_core::conf::value_to_conf;
-use hyprconf_core::schema::{CollectionId, OptionSpec, ValueType};
-use hyprconf_core::structured::{
-    Animation, Bezier, EnvVar, Exec, ExecKind, Keybind, LayerRule, MonitorRule, Submap, Variable,
-    WindowRule, WorkspaceRule,
-};
+use hyprconf_core::schema::CollectionId;
 use hyprconf_core::value::Color as HyprColor;
 use hyprconf_core::{ConfigFormat, Severity, Value};
 
 use crate::diff::Tag;
-use crate::edit::{
-    env_issue, exec_issue, extra_field, fmt_num, has_mod, keybind_issue, layer_rule_issue,
-    monitor_issue, parse_matchers, window_rule_issue, BindFlag, CollectionAction, ColorChannel,
-    Dir, EditAction, EnvEdit, ExecEdit, KeybindEdit, LayerRuleEdit, MonitorEdit, Slot,
-    WindowRuleEdit, DISPATCHERS, MODS,
-};
-use crate::load::{format_label, LoadState, Loaded};
+use crate::edit::{ColorChannel, EditAction, Slot};
+use crate::load::{format_label, Diagnostic, LoadState, Loaded};
 use crate::save::{self, SaveMode};
-use crate::{color_picker, fuzzy, App, Message, Selection};
+use crate::{color_picker, App, Message, Selection};
 
+mod collections;
+mod migrate;
+mod monitor_canvas;
+mod monitors;
+mod nav;
+mod options;
 mod styles;
 use styles::*;
 
-const SIDEBAR_WIDTH: f32 = 260.0;
+// Shared with `monitors` (which builds its raw-rule list from these).
+use collections::{chip, coll_text, monitor_row};
+use nav::{collection_count, collection_icon};
+use options::EnumChoice;
+
+/// The search field's widget id, so Ctrl+F can focus it from `update`.
+pub const SEARCH_ID: &str = "hyprconf-search";
 const BOLD: Font = Font {
     weight: iced::font::Weight::Bold,
     ..Font::DEFAULT
@@ -40,13 +42,18 @@ const MONO: Font = Font::MONOSPACE;
 /// The whole window: header / [sidebar | content] / status bar, with the color
 /// picker floating above as a modal when open.
 pub fn view(app: &App) -> Element<'_, Message> {
-    let base: Element<Message> = column![
-        header(app),
-        row![sidebar(app), content(app)].height(Length::Fill),
-        status_bar(app),
-    ]
-    .into();
+    let mut shell = column![header(app)];
+    if app.show_deprecation_banner() {
+        shell = shell.push(container(migrate::deprecation_banner(app)).padding([8, 18]));
+    }
+    let base: Element<Message> = shell
+        .push(row![nav::sidebar(app), content(app)].height(Length::Fill))
+        .push(status_bar(app))
+        .into();
 
+    if app.show_shortcuts {
+        return modal(base, shortcuts_panel(), Message::ToggleShortcuts);
+    }
     match &app.color_picker {
         Some(draft) => modal(
             base,
@@ -55,6 +62,52 @@ pub fn view(app: &App) -> Element<'_, Message> {
         ),
         None => base,
     }
+}
+
+/// Every keyboard shortcut, in one sheet.
+///
+/// Shortcuts that nobody can discover may as well not exist; the tooltips on
+/// individual buttons only cover the ones that *have* a button.
+fn shortcuts_panel() -> Element<'static, Message> {
+    const KEYS: [(&str, &str); 8] = [
+        ("Ctrl + K / Ctrl + F", "Focus the search field"),
+        ("Enter", "Open the best search hit's section"),
+        ("Esc", "Back out one layer (modal → panel → search)"),
+        ("Ctrl + Z", "Undo"),
+        ("Ctrl + Shift + Z / Ctrl + Y", "Redo"),
+        ("Ctrl + S", "Open the save panel"),
+        ("Ctrl + P", "Profiles & recent files"),
+        ("Ctrl + /", "This sheet"),
+    ];
+
+    let rows = Column::with_children(KEYS.map(|(keys, what)| {
+        row![
+            container(text(keys).size(12).font(MONO))
+                .padding([2, 8])
+                .style(badge_style),
+            Space::new().width(Length::Fixed(14.0)),
+            text(what).size(13),
+        ]
+        .align_y(Alignment::Center)
+        .into()
+    }))
+    .spacing(8);
+
+    let header = row![
+        text("Keyboard shortcuts").size(16).font(BOLD),
+        Space::new().width(Length::Fill),
+        button(text("✕").size(14))
+            .padding([2, 8])
+            .on_press(Message::ToggleShortcuts)
+            .style(ghost_button),
+    ]
+    .align_y(Alignment::Center);
+
+    container(column![header, rows].spacing(16))
+        .padding(20)
+        .max_width(460.0)
+        .style(card_style)
+        .into()
 }
 
 /// Float `content` (a dimmed, click-to-dismiss modal) above `base`.
@@ -96,27 +149,66 @@ fn header(app: &App) -> Element<'_, Message> {
     .spacing(8)
     .align_y(Alignment::Center);
 
-    let search = text_input("Search options…", &app.search)
+    // The search field is the only elastic element, but it must not be squeezed
+    // to nothing by the toolbar on a narrow window — below ~1080px it stops
+    // growing and the toolbar wraps into icon-only form instead.
+    let search = text_input("Search settings…  (Ctrl+K)", &app.search)
+        .id(SEARCH_ID)
         .on_input(Message::SearchChanged)
+        // Enter jumps to the best hit's section, so a search can be finished
+        // entirely from the keyboard.
+        .on_submit(match app.hits.options.first() {
+            Some(hit) => Message::Selected(Selection::Section(hit.section.to_string())),
+            None => Message::Escape,
+        })
         .padding([8, 12])
         .size(15)
         .width(Length::Fill);
 
-    let theme_picker = row![
-        text("Theme").size(13).style(muted),
-        pick_list(Theme::ALL, Some(app.theme.clone()), Message::ThemeSelected)
-            .text_size(13)
-            .padding([6, 10])
-            .width(Length::Fixed(170.0)),
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center);
+    // A clear button only when there is something to clear — an always-present
+    // "✕" next to an empty field is just noise.
+    let search: Element<Message> = if app.search.is_empty() {
+        search.into()
+    } else {
+        row![
+            search,
+            button(text("✕").size(12))
+                .padding([6, 10])
+                .on_press(Message::Escape)
+                .style(ghost_button),
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center)
+        .into()
+    };
 
-    let mut bar = row![brand, search].spacing(20).align_y(Alignment::Center);
+    // The dropdown already shows the theme name, so the "Theme" label was
+    // redundant width in the most contested row of the UI.
+    let theme_picker = pick_list(Theme::ALL, Some(app.theme.clone()), Message::ThemeSelected)
+        .text_size(13)
+        .padding([6, 10])
+        .width(Length::Fixed(160.0));
+
+    let mut bar = row![brand, search].spacing(16).align_y(Alignment::Center);
     if let Some(changes) = changes_indicator(app) {
         bar = bar.push(changes);
     }
     if app.load.loaded().is_some() {
+        // Keep the migration reachable after the banner has been dismissed —
+        // otherwise dismissing it hides the feature for the whole session.
+        if app
+            .load
+            .loaded()
+            .is_some_and(|l| crate::migrate::should_warn(l.format))
+            && app.migration.is_none()
+        {
+            bar = bar.push(
+                button(text("→ Lua").size(13))
+                    .padding([6, 12])
+                    .on_press(Message::StartMigration)
+                    .style(primary_button),
+            );
+        }
         bar = bar.push(history_button(
             "↶",
             "Undo (Ctrl+Z)",
@@ -134,6 +226,11 @@ fn header(app: &App) -> Element<'_, Message> {
         ));
         bar = bar.push(toolbar_toggle("save…", app.show_save, Message::ToggleSave));
     }
+    bar = bar.push(history_button(
+        "?",
+        "Keyboard shortcuts (Ctrl+/)",
+        Some(Message::ToggleShortcuts),
+    ));
     bar = bar.push(theme_picker);
 
     container(bar)
@@ -207,144 +304,20 @@ fn toolbar_toggle(
 }
 
 // ---------------------------------------------------------------------------
-// sidebar
-// ---------------------------------------------------------------------------
-
-fn sidebar(app: &App) -> Element<'_, Message> {
-    let compact = is_compact(app);
-    let active = app.search.trim().is_empty() && !app.show_profiles;
-    let mut items: Vec<Element<Message>> = Vec::new();
-
-    if !compact {
-        items.push(group_header("SECTIONS"));
-    }
-    for section in app.schema.sections() {
-        let selection = Selection::Section(section.id.clone());
-        let selected = active && app.selected == selection;
-        items.push(nav_button(
-            section_icon(&section.id),
-            section.label.clone(),
-            selection,
-            selected,
-            None,
-            compact,
-        ));
-    }
-
-    items.push(Space::new().height(Length::Fixed(14.0)).into());
-    if !compact {
-        items.push(group_header("COLLECTIONS"));
-    }
-    for collection in app.schema.collections() {
-        let count = collection_count(app, collection.id);
-        let selection = Selection::Collection(collection.id);
-        let selected = active && app.selected == selection;
-        items.push(nav_button(
-            collection_icon(collection.id),
-            collection.label.clone(),
-            selection,
-            selected,
-            (!compact).then_some(count),
-            compact,
-        ));
-    }
-
-    let list = Column::with_children(items)
-        .spacing(3)
-        .padding([12, if compact { 6 } else { 10 }])
-        .width(Length::Fill);
-
-    container(scrollable(list).height(Length::Fill))
-        .width(Length::Fixed(if compact { 60.0 } else { SIDEBAR_WIDTH }))
-        .height(Length::Fill)
-        .style(panel_style)
-        .into()
-}
-
-/// Below this window width the sidebar collapses to icons-only.
-fn is_compact(app: &App) -> bool {
-    app.settings.window_width < 860.0
-}
-
-fn group_header(label: &str) -> Element<'_, Message> {
-    container(text(label.to_string()).size(11).font(BOLD).style(muted))
-        .padding([8, 8])
-        .into()
-}
-
-fn nav_button(
-    icon: &'static str,
-    label: String,
-    selection: Selection,
-    selected: bool,
-    badge: Option<usize>,
-    compact: bool,
-) -> Element<'static, Message> {
-    if compact {
-        let b = button(container(text(icon).size(16)).center_x(Length::Fill))
-            .width(Length::Fill)
-            .padding([8, 0])
-            .on_press(Message::Selected(selection))
-            .style(move |theme: &Theme, status| nav_style(theme, status, selected));
-        return tooltip(
-            b,
-            container(text(label).size(12))
-                .padding([6, 10])
-                .style(tooltip_style),
-            tooltip::Position::Right,
-        )
-        .into();
-    }
-
-    let mut inner = row![text(icon).size(15), text(label).size(14)]
-        .spacing(10)
-        .align_y(Alignment::Center)
-        .width(Length::Fill);
-
-    if let Some(count) = badge {
-        inner = inner.push(count_badge(count));
-    }
-
-    button(inner)
-        .width(Length::Fill)
-        .padding([7, 12])
-        .on_press(Message::Selected(selection))
-        .style(move |theme: &Theme, status| nav_style(theme, status, selected))
-        .into()
-}
-
-fn count_badge(count: usize) -> Element<'static, Message> {
-    container(text(count.to_string()).size(11))
-        .padding([1, 7])
-        .style(badge_style)
-        .into()
-}
-
-fn collection_count(app: &App, id: CollectionId) -> usize {
-    let Some(loaded) = app.load.loaded() else {
-        return 0;
-    };
-    let c = &loaded.config;
-    match id {
-        CollectionId::Monitors => c.monitors.len(),
-        CollectionId::Workspaces => c.workspaces.len(),
-        CollectionId::WindowRules => c.window_rules.len(),
-        CollectionId::LayerRules => c.layer_rules.len(),
-        CollectionId::Keybinds => c.keybinds.len(),
-        CollectionId::Submaps => c.submaps.len(),
-        CollectionId::Env => c.env.len(),
-        CollectionId::Execs => c.execs.len(),
-        CollectionId::Variables => c.variables.len(),
-        CollectionId::Beziers => c.beziers.len(),
-        CollectionId::Animations => c.animations.len(),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // content area
 // ---------------------------------------------------------------------------
 
 fn content(app: &App) -> Element<'_, Message> {
+    // The migration flow takes the whole pane: it is a linear, commit-oriented
+    // task, and leaving the editor visible alongside it invites half-finished
+    // edits that the already-generated Lua would not include.
+    if let Some(m) = &app.migration {
+        return container(migrate::migrate_view(app, m))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(20)
+            .into();
+    }
     if app.show_profiles {
         return container(profiles_view(app))
             .width(Length::Fill)
@@ -357,7 +330,9 @@ fn content(app: &App) -> Element<'_, Message> {
         LoadState::NotFound { searched } => not_found_view(searched),
         LoadState::Error { path, message } => error_view(&path.display().to_string(), message),
         LoadState::Loaded(loaded) => {
-            if app.show_save {
+            if app.show_diagnostics {
+                diagnostics_view(loaded)
+            } else if app.show_save {
                 // The preview is precomputed in `update`; `None` only if a
                 // refresh was somehow missed, so degrade gracefully.
                 match &app.save_preview {
@@ -368,11 +343,14 @@ fn content(app: &App) -> Element<'_, Message> {
                 changes_view(app, loaded)
             } else if app.search.trim().is_empty() {
                 match &app.selected {
-                    Selection::Section(id) => section_view(app, loaded, id),
-                    Selection::Collection(id) => collection_view(app, loaded, *id),
+                    Selection::Section(id) => options::section_view(app, loaded, id),
+                    // Monitors is the one collection that isn't really a list of
+                    // text: it gets a hardware-driven screen of its own.
+                    Selection::Collection(CollectionId::Monitors) => monitors::view(app, loaded),
+                    Selection::Collection(id) => collections::collection_view(app, loaded, *id),
                 }
             } else {
-                search_results(app, loaded)
+                options::search_results(app, loaded)
             }
         }
     };
@@ -415,471 +393,73 @@ fn not_found_view(searched: &[std::path::PathBuf]) -> Element<'static, Message> 
 }
 
 fn error_view(path: &str, message: &str) -> Element<'static, Message> {
-    centered(
-        Column::with_children(vec![
-            text("⚠").size(40).style(danger).into(),
-            text("Failed to load configuration")
-                .size(20)
-                .font(BOLD)
-                .into(),
-            text(path.to_string()).size(13).style(muted).into(),
-            text(message.to_string()).size(13).style(danger).into(),
-        ])
-        .spacing(8)
-        .align_x(Alignment::Center),
-    )
+    let body = column![
+        text("⚠").size(40).style(danger),
+        text("Couldn’t load this configuration").size(20).font(BOLD),
+        text(path.to_string()).size(13).font(MONO).style(muted),
+        container(text(format!("Reason: {message}")).size(13).style(danger)).max_width(560.0),
+        Space::new().height(Length::Fixed(6.0)),
+        container(
+            text(
+                "Fix the problem above in your editor and reopen, or start hyprconf with \
+                 “--config <path>” to open a different file. Your file was not modified.",
+            )
+            .size(13)
+            .style(muted),
+        )
+        .max_width(560.0),
+    ]
+    .spacing(8)
+    .align_x(Alignment::Center);
+    centered(body)
 }
 
-fn pane_header(
-    icon: &str,
-    title: String,
-    subtitle: String,
-    trailing: String,
-) -> Element<'static, Message> {
-    let mut left = row![text(icon.to_string()).size(26)]
-        .spacing(12)
-        .align_y(Alignment::Center);
-    left = left.push(
+/// A pane's title card. `title`/`subtitle` are borrowed — most callers pass
+/// `&'static Schema` strings, and cloning them on every frame was pure waste.
+fn pane_header<'a>(
+    icon: &'static str,
+    title: impl text::IntoFragment<'a>,
+    subtitle: impl text::IntoFragment<'a>,
+    trailing: Element<'a, Message>,
+) -> Element<'a, Message> {
+    let left = row![
+        text(icon).size(26),
         column![
             text(title).size(22).font(BOLD),
             text(subtitle).size(13).style(muted),
         ]
         .spacing(2),
-    );
-
-    container(
-        row![
-            left.width(Length::Fill),
-            text(trailing).size(13).style(muted),
-        ]
-        .align_y(Alignment::Center),
-    )
-    .padding([14, 18])
-    .width(Length::Fill)
-    .style(card_style)
-    .into()
-}
-
-fn section_view(app: &App, loaded: &Loaded, id: &str) -> Element<'static, Message> {
-    let Some(section) = app.schema.section(id) else {
-        return centered(text("Unknown section"));
-    };
-
-    let set = section
-        .options
-        .iter()
-        .filter(|o| loaded.config.get(&o.path).is_some())
-        .count();
-    let trailing = format!("{set} set · {} total", section.options.len());
-
-    let mut items: Vec<Element<Message>> = vec![
-        pane_header(
-            section_icon(id),
-            section.label.clone(),
-            section.description.clone(),
-            trailing,
-        ),
-        Space::new().height(Length::Fixed(4.0)).into(),
-    ];
-    for opt in &section.options {
-        items.push(option_editor(opt, loaded));
-    }
-
-    scroll(items)
-}
-
-// ---------------------------------------------------------------------------
-// per-option editor
-// ---------------------------------------------------------------------------
-
-fn option_editor(opt: &OptionSpec, loaded: &Loaded) -> Element<'static, Message> {
-    let path = opt.path.clone();
-    let dirty = loaded.is_dirty(&path);
-    let is_default = loaded.config.get(&path).is_none();
-
-    let label_row = row![
-        text(opt.label.clone()).size(15),
-        info_tooltip(&opt.description),
-        dirty_dot(dirty),
-        Space::new().width(Length::Fill),
-        reset_button(path.clone(), is_default),
     ]
-    .spacing(8)
+    .spacing(12)
     .align_y(Alignment::Center);
 
-    let mut col = column![label_row, type_editor(opt, loaded)].spacing(10);
-
-    if let Some(err) = loaded.first_error(&path) {
-        col = col.push(text(format!("⚠ {err}")).size(11).style(danger));
-    }
-    col = col.push(text(opt.path.clone()).size(10).style(muted));
-
-    container(col)
-        .padding([12, 16])
+    container(row![left.width(Length::Fill), trailing].align_y(Alignment::Center))
+        .padding([14, 18])
         .width(Length::Fill)
         .style(card_style)
         .into()
 }
 
-fn info_tooltip(description: &str) -> Element<'static, Message> {
-    if description.is_empty() {
-        return Space::new().width(0).into();
-    }
-    tooltip(
-        text("ⓘ").size(12).style(muted),
-        container(text(description.to_string()).size(12))
-            .padding([6, 10])
-            .max_width(320.0)
-            .style(tooltip_style),
-        tooltip::Position::Bottom,
+/// [`pane_header`] whose trailing slot is a plain count/status label.
+fn pane_header_count<'a>(
+    icon: &'static str,
+    title: impl text::IntoFragment<'a>,
+    subtitle: impl text::IntoFragment<'a>,
+    trailing: impl text::IntoFragment<'a>,
+) -> Element<'a, Message> {
+    pane_header(
+        icon,
+        title,
+        subtitle,
+        text(trailing).size(13).style(muted).into(),
     )
-    .into()
 }
 
-fn dirty_dot(dirty: bool) -> Element<'static, Message> {
-    if dirty {
-        text("●").size(10).style(accent).into()
-    } else {
-        Space::new().width(0).into()
-    }
-}
-
-fn reset_button(path: String, is_default: bool) -> Element<'static, Message> {
-    let button = button(text("↺ reset").size(12))
-        .padding([3, 8])
-        .style(ghost_button);
-    // Resetting an already-default option is a no-op; disable the press then.
-    let button = if is_default {
-        button
-    } else {
-        button.on_press(Message::Edit(EditAction::Reset(path)))
-    };
-    tooltip(
-        button,
-        container(text("Reset to default").size(12))
-            .padding([6, 10])
-            .style(tooltip_style),
-        tooltip::Position::Left,
-    )
-    .into()
-}
-
-fn type_editor(opt: &OptionSpec, loaded: &Loaded) -> Element<'static, Message> {
-    match &opt.value_type {
-        ValueType::Bool => bool_editor(opt, loaded),
-        ValueType::Int => number_editor(opt, loaded, true),
-        ValueType::Float => number_editor(opt, loaded, false),
-        ValueType::String => string_editor(opt, loaded),
-        ValueType::Enum(_) => enum_editor(opt, loaded),
-        ValueType::Color => color_editor(opt, loaded),
-        ValueType::Gradient => gradient_editor(opt, loaded),
-        ValueType::Vec2 => vec2_editor(opt, loaded),
-        _ => text("(not editable here)").size(13).style(muted).into(),
-    }
-}
-
-fn bool_editor(opt: &OptionSpec, loaded: &Loaded) -> Element<'static, Message> {
-    let on = matches!(loaded.value_for(opt), Value::Bool(true));
-    let path = opt.path.clone();
-    row![
-        toggler(on)
-            .on_toggle(move |b| Message::Edit(EditAction::SetBool(path.clone(), b)))
-            .size(22),
-        text(if on { "Enabled" } else { "Disabled" })
-            .size(13)
-            .style(muted),
-    ]
-    .spacing(10)
-    .align_y(Alignment::Center)
-    .into()
-}
-
-fn number_editor(opt: &OptionSpec, loaded: &Loaded, is_int: bool) -> Element<'static, Message> {
-    let path = opt.path.clone();
-    let current = match loaded.value_for(opt) {
-        Value::Int(i) => i as f64,
-        Value::Float(x) => x,
-        _ => 0.0,
-    };
-    let draft = loaded
-        .draft(&path, Slot::Main)
-        .map(str::to_string)
-        .unwrap_or_else(|| fmt_num(current));
-    let has_err = loaded.field_error(&path, Slot::Main).is_some();
-
-    let input = text_field(&draft, &path, Slot::Main, has_err, Length::Fixed(120.0), "");
-
-    let mut row = row![]
-        .spacing(14)
-        .align_y(Alignment::Center)
-        .width(Length::Fill);
-    if let Some(range) = &opt.range {
-        if let (Some(min), Some(max)) = (range.min, range.max) {
-            let value = current.clamp(min, max);
-            let p = path.clone();
-            let step = if is_int {
-                range.step.unwrap_or(1.0).max(1.0)
-            } else {
-                range.step.unwrap_or(((max - min) / 100.0).max(0.001))
-            };
-            let s = slider(min..=max, value, move |v| {
-                if is_int {
-                    Message::Edit(EditAction::SetIntSlider(p.clone(), v.round() as i64))
-                } else {
-                    Message::Edit(EditAction::SetFloatSlider(p.clone(), v))
-                }
-            })
-            .step(step)
-            .width(Length::Fill);
-            row = row.push(s);
-        }
-    }
-    row.push(input).into()
-}
-
-fn string_editor(opt: &OptionSpec, loaded: &Loaded) -> Element<'static, Message> {
-    let path = opt.path.clone();
-    let current = match loaded.value_for(opt) {
-        Value::String(s) => s,
-        other => value_to_conf(&other),
-    };
-    let draft = loaded
-        .draft(&path, Slot::Main)
-        .map(str::to_string)
-        .unwrap_or(current);
-    text_field(&draft, &path, Slot::Main, false, Length::Fill, "value")
-}
-
-/// A selectable enum variant: the dropdown shows a human-friendly [`label`]
-/// while edits round-trip the literal [`value`] written to the config.
-///
-/// Equality is by `value` only so the `pick_list` highlights the active choice
-/// regardless of how its label is formatted.
-#[derive(Clone)]
-struct EnumChoice {
-    value: String,
-    label: String,
-}
-
-impl PartialEq for EnumChoice {
-    fn eq(&self, other: &Self) -> bool {
-        self.value == other.value
-    }
-}
-
-impl std::fmt::Display for EnumChoice {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.label)
-    }
-}
-
-/// Build a dropdown label for an enum variant. Numeric "mode" literals (and the
-/// empty/unset literal) are cryptic on their own, so their meaning is shown
-/// inline (e.g. `1  ·  Follow`); self-describing textual variants (e.g.
-/// `dwindle`) are shown as-is, with the full description in the helper line.
-fn enum_choice_label(name: &str, description: Option<&str>) -> String {
-    let shown = if name.is_empty() { "(unset)" } else { name };
-    match description {
-        Some(desc) if name.is_empty() || name.parse::<f64>().is_ok() => {
-            format!("{shown}  ·  {}", desc_headline(desc))
-        }
-        _ => shown.to_string(),
-    }
-}
-
-/// The leading clause of a variant description, for compact dropdown entries.
-fn desc_headline(description: &str) -> &str {
-    description
-        .split([':', '.', '('])
-        .next()
-        .unwrap_or(description)
-        .trim()
-}
-
-fn enum_editor(opt: &OptionSpec, loaded: &Loaded) -> Element<'static, Message> {
-    let path = opt.path.clone();
-    let variants = opt.enum_variants().unwrap_or_default();
-
-    // The literal currently in effect (an explicit selection, or the default).
-    // A value Hyprland accepts but we don't enumerate (e.g. a plugin-provided
-    // layout) arrives as a `String`; keep it visible and selectable.
-    let current = match loaded.value_for(opt) {
-        Value::Enum(name) => name,
-        Value::String(s) => s,
-        other => value_to_conf(&other),
-    };
-
-    let mut choices: Vec<EnumChoice> = variants
-        .iter()
-        .map(|v| EnumChoice {
-            value: v.name.clone(),
-            label: enum_choice_label(&v.name, v.description.as_deref()),
-        })
-        .collect();
-    if !choices.iter().any(|c| c.value == current) {
-        let label = if current.is_empty() {
-            "(unset)".to_string()
-        } else {
-            current.clone()
-        };
-        choices.insert(
-            0,
-            EnumChoice {
-                value: current.clone(),
-                label,
-            },
-        );
-    }
-
-    let selected = choices.iter().find(|c| c.value == current).cloned();
-    let selected_desc = variants
-        .iter()
-        .find(|v| v.name == current)
-        .and_then(|v| v.description.clone());
-
-    let picker = pick_list(choices, selected, move |c: EnumChoice| {
-        Message::Edit(EditAction::SetEnum(path.clone(), c.value))
-    })
-    .padding([6, 10])
-    .text_size(14)
-    .width(Length::Fixed(300.0));
-
-    let mut col = column![picker].spacing(6);
-    if let Some(desc) = selected_desc {
-        col = col.push(text(desc).size(11).style(muted));
-    }
-    col.into()
-}
-
-fn color_editor(opt: &OptionSpec, loaded: &Loaded) -> Element<'static, Message> {
-    let path = opt.path.clone();
-    let color = match loaded.value_for(opt) {
-        Value::Color(c) => c,
-        _ => HyprColor::rgba(0, 0, 0, 0xff),
-    };
-    let hex_draft = loaded
-        .draft(&path, Slot::Hex)
-        .map(str::to_string)
-        .unwrap_or_else(|| color.to_rgba_string());
-    let hex_err = loaded.field_error(&path, Slot::Hex).is_some();
-
-    // Edited like every other color option (gradient stops, border colors):
-    // a swatch + hex field + "pick" button that opens the visual picker. The
-    // R/G/B/A sliders live in that popup, not inline here.
-    row![
-        swatch_button(color, path.clone()),
-        text_field(
-            &hex_draft,
-            &path,
-            Slot::Hex,
-            hex_err,
-            Length::Fill,
-            "rgba(rrggbbaa)"
-        ),
-        pick_button(path.clone()),
-    ]
-    .spacing(10)
-    .align_y(Alignment::Center)
-    .into()
-}
-
-fn gradient_editor(opt: &OptionSpec, loaded: &Loaded) -> Element<'static, Message> {
-    let path = opt.path.clone();
-    let gradient = match loaded.value_for(opt) {
-        Value::Gradient(g) => g,
-        _ => return text("(invalid gradient)").size(13).style(danger).into(),
-    };
-
-    let mut rows: Vec<Element<Message>> = Vec::new();
-    let count = gradient.stops.len();
-    for (i, stop) in gradient.stops.iter().enumerate() {
-        let draft = loaded
-            .draft(&path, Slot::Stop(i))
-            .map(str::to_string)
-            .unwrap_or_else(|| stop.to_rgba_string());
-        let err = loaded.field_error(&path, Slot::Stop(i)).is_some();
-        let p = path.clone();
-        let remove = if count > 1 {
-            button(text("✕").size(12))
-                .padding([3, 7])
-                .on_press(Message::Edit(EditAction::RemoveStop(p, i)))
-                .style(ghost_button)
-        } else {
-            button(text("✕").size(12))
-                .padding([3, 7])
-                .style(ghost_button)
-        };
-        rows.push(
-            row![
-                stop_swatch_button(*stop, path.clone(), i),
-                text_field(&draft, &path, Slot::Stop(i), err, Length::Fill, "rgba(...)"),
-                stop_pick_button(path.clone(), i),
-                remove,
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center)
-            .into(),
-        );
-    }
-
-    let add_path = path.clone();
-    let add = button(text("+ add stop").size(12))
-        .padding([4, 10])
-        .on_press(Message::Edit(EditAction::AddStop(add_path)))
-        .style(ghost_button);
-
-    let angle_draft = loaded
-        .draft(&path, Slot::Angle)
-        .map(str::to_string)
-        .unwrap_or_else(|| gradient.angle_deg.map(fmt_num).unwrap_or_default());
-    let angle_err = loaded.field_error(&path, Slot::Angle).is_some();
-    let angle_row = row![
-        add,
-        Space::new().width(Length::Fill),
-        text("Angle°").size(12).style(muted),
-        text_field(
-            &angle_draft,
-            &path,
-            Slot::Angle,
-            angle_err,
-            Length::Fixed(80.0),
-            "deg"
-        ),
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center);
-
-    column![Column::with_children(rows).spacing(6), angle_row]
-        .spacing(8)
+/// A muted, indented note for an intentionally empty list.
+fn empty_note(message: &'static str) -> Element<'static, Message> {
+    container(text(message).size(13).style(muted))
+        .padding([10, 14])
         .into()
-}
-
-fn vec2_editor(opt: &OptionSpec, loaded: &Loaded) -> Element<'static, Message> {
-    let path = opt.path.clone();
-    let vec2 = match loaded.value_for(opt) {
-        Value::Vec2(v) => v,
-        _ => hyprconf_core::value::Vec2::new(0.0, 0.0),
-    };
-    let xd = loaded
-        .draft(&path, Slot::X)
-        .map(str::to_string)
-        .unwrap_or_else(|| fmt_num(vec2.x));
-    let yd = loaded
-        .draft(&path, Slot::Y)
-        .map(str::to_string)
-        .unwrap_or_else(|| fmt_num(vec2.y));
-    let xe = loaded.field_error(&path, Slot::X).is_some();
-    let ye = loaded.field_error(&path, Slot::Y).is_some();
-
-    row![
-        text("x").size(13).style(muted),
-        text_field(&xd, &path, Slot::X, xe, Length::Fixed(110.0), ""),
-        text("y").size(13).style(muted),
-        text_field(&yd, &path, Slot::Y, ye, Length::Fixed(110.0), ""),
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center)
-    .into()
 }
 
 /// A validated text input bound to a field's draft.
@@ -898,62 +478,6 @@ fn text_field(
         .size(14)
         .width(width)
         .style(move |theme: &Theme, status| input_style(theme, status, has_error))
-        .into()
-}
-
-/// A small rounded color swatch.
-fn color_swatch(color: HyprColor, w: f32, h: f32) -> Element<'static, Message> {
-    let fill = Color::from_rgba8(color.r, color.g, color.b, color.a as f32 / 255.0);
-    container(
-        Space::new()
-            .width(Length::Fixed(w))
-            .height(Length::Fixed(h)),
-    )
-    .style(move |theme: &Theme| container::Style {
-        background: Some(fill.into()),
-        border: Border {
-            color: theme.extended_palette().background.strong.color,
-            width: 1.0,
-            radius: 6.0.into(),
-        },
-        ..container::Style::default()
-    })
-    .into()
-}
-
-/// The color preview swatch, as a button that opens the visual picker.
-fn swatch_button(color: HyprColor, path: String) -> Element<'static, Message> {
-    button(color_swatch(color, 34.0, 24.0))
-        .padding(2.0)
-        .on_press(Message::OpenColorPicker(path))
-        .style(ghost_button)
-        .into()
-}
-
-/// The "open the visual picker" affordance next to a color field.
-fn pick_button(path: String) -> Element<'static, Message> {
-    button(text("🎨 pick").size(12))
-        .padding([4, 10])
-        .on_press(Message::OpenColorPicker(path))
-        .style(ghost_button)
-        .into()
-}
-
-/// A gradient stop's swatch, as a button that opens the visual picker for it.
-fn stop_swatch_button(color: HyprColor, path: String, index: usize) -> Element<'static, Message> {
-    button(color_swatch(color, 30.0, 22.0))
-        .padding(2.0)
-        .on_press(Message::OpenStopColorPicker(path, index))
-        .style(ghost_button)
-        .into()
-}
-
-/// The "open the visual picker" icon for a gradient stop.
-fn stop_pick_button(path: String, index: usize) -> Element<'static, Message> {
-    button(text("🎨").size(12))
-        .padding([4, 8])
-        .on_press(Message::OpenStopColorPicker(path, index))
-        .style(ghost_button)
         .into()
 }
 
@@ -1134,10 +658,10 @@ fn changes_view(app: &App, loaded: &Loaded) -> Element<'static, Message> {
     let trailing = format!("{total} change{}", if total == 1 { "" } else { "s" });
 
     let mut items: Vec<Element<Message>> = vec![
-        pane_header(
+        pane_header_count(
             "✎",
-            "Pending changes".to_string(),
-            "Unsaved edits relative to the loaded file.".to_string(),
+            "Pending changes",
+            "Unsaved edits relative to the loaded file.",
             trailing,
         ),
         Space::new().height(Length::Fixed(4.0)).into(),
@@ -1190,10 +714,16 @@ fn changes_view(app: &App, loaded: &Loaded) -> Element<'static, Message> {
             ]
             .spacing(3)
             .width(Length::Fill),
-            button(text("↺ reset").size(12))
-                .padding([3, 8])
-                .on_press(Message::Edit(EditAction::Reset(reset_path)))
-                .style(ghost_button),
+            tooltip(
+                button(text("↶ revert").size(12))
+                    .padding([3, 8])
+                    .on_press(Message::Edit(EditAction::Revert(reset_path)))
+                    .style(ghost_button),
+                container(text("Back to the value in the file").size(12))
+                    .padding([6, 10])
+                    .style(tooltip_style),
+                tooltip::Position::Left,
+            ),
         ]
         .spacing(12)
         .align_y(Alignment::Center);
@@ -1211,16 +741,92 @@ fn changes_view(app: &App, loaded: &Loaded) -> Element<'static, Message> {
 }
 
 // ---------------------------------------------------------------------------
+// diagnostics (issues found while loading)
+// ---------------------------------------------------------------------------
+
+/// The list of non-fatal issues found while reading the config, each explained
+/// in plain language with its location and a hint on what to do.
+fn diagnostics_view(loaded: &Loaded) -> Element<'static, Message> {
+    let diagnostics = &loaded.diagnostics;
+    let n = diagnostics.len();
+    let trailing = format!("{n} item{}", if n == 1 { "" } else { "s" });
+
+    let mut items: Vec<Element<Message>> = vec![
+        pane_header_count(
+            "⚠",
+            "Diagnostics",
+            "Issues found while reading your configuration. Nothing was lost — every line on \
+             disk is preserved untouched.",
+            trailing,
+        ),
+        Space::new().height(Length::Fixed(4.0)).into(),
+    ];
+
+    if diagnostics.is_empty() {
+        items.push(
+            container(
+                text("✓ No problems — your configuration was understood completely.")
+                    .size(14)
+                    .style(success),
+            )
+            .padding([12, 16])
+            .width(Length::Fill)
+            .style(card_style)
+            .into(),
+        );
+        return scroll(items);
+    }
+
+    for diagnostic in diagnostics {
+        items.push(diagnostic_card(diagnostic));
+    }
+
+    scroll(items)
+}
+
+/// One diagnostic rendered as a card: a severity marker and message, then its
+/// source location and a fix hint when known.
+fn diagnostic_card(diagnostic: &Diagnostic) -> Element<'static, Message> {
+    let icon = severity_icon(diagnostic.severity);
+    let icon_style = severity_style(diagnostic.severity);
+
+    let mut col = column![row![
+        text(icon).size(14).style(icon_style),
+        text(diagnostic.message.clone()).size(14),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)]
+    .spacing(6);
+
+    if let Some(location) = &diagnostic.location {
+        col = col.push(
+            text(format!("at {location}"))
+                .size(12)
+                .font(MONO)
+                .style(muted),
+        );
+    }
+    if let Some(hint) = &diagnostic.hint {
+        col = col.push(text(format!("→ {hint}")).size(12).style(muted));
+    }
+
+    container(col)
+        .padding([12, 16])
+        .width(Length::Fill)
+        .style(card_style)
+        .into()
+}
+
+// ---------------------------------------------------------------------------
 // profiles & recent files
 // ---------------------------------------------------------------------------
 
-fn profiles_view(app: &App) -> Element<'static, Message> {
-    let mut items: Vec<Element<Message>> = vec![pane_header(
+fn profiles_view(app: &App) -> Element<'_, Message> {
+    let mut items: Vec<Element<Message>> = vec![pane_header_count(
         "🗂",
-        "Profiles & recents".to_string(),
-        "Save the current config as a named profile, reopen recents, or import any file."
-            .to_string(),
-        String::new(),
+        "Profiles & recents",
+        "Save the current config as a named profile, reopen recents, or import any file.",
+        "",
     )];
 
     // Save-as card (only meaningful with a loaded config).
@@ -1260,19 +866,19 @@ fn profiles_view(app: &App) -> Element<'static, Message> {
         );
     }
 
-    // Saved profiles.
+    // Saved profiles. The list is read in `update` when this panel opens —
+    // never here: a `read_dir` on the render path is filesystem I/O per frame.
     let mut saved = column![text("Saved profiles").size(14).font(BOLD)].spacing(8);
-    let profiles = crate::profiles::list();
-    if profiles.is_empty() {
+    if app.profiles.is_empty() {
         saved = saved.push(text("No saved profiles yet.").size(12).style(muted));
     }
-    for profile in profiles {
+    for profile in &app.profiles {
         saved = saved.push(
             row![
-                text(profile.name).size(14).width(Length::Fill),
+                text(&profile.name).size(14).width(Length::Fill),
                 button(text("open").size(12))
                     .padding([3, 10])
-                    .on_press(Message::OpenPath(profile.path))
+                    .on_press(Message::OpenPath(profile.path.clone()))
                     .style(ghost_button),
             ]
             .spacing(8)
@@ -1361,9 +967,9 @@ fn save_view(app: &App, loaded: &Loaded, preview: &save::SavePreview) -> Element
     } else {
         format!("Mode: {mode_label}. Review the diff, then write.")
     };
-    let mut items: Vec<Element<Message>> = vec![pane_header(
+    let mut items: Vec<Element<Message>> = vec![pane_header_count(
         "💾",
-        "Save".to_string(),
+        "Save",
         subtitle,
         format!("{} change(s)", plan.changed_files().len()),
     )];
@@ -1402,7 +1008,7 @@ fn save_view(app: &App, loaded: &Loaded, preview: &save::SavePreview) -> Element
                     plan.drops_dynamic
                 ))
                 .size(13)
-                .style(danger),
+                .style(warn_style),
             )
             .padding([10, 14])
             .width(Length::Fill)
@@ -1486,10 +1092,8 @@ fn validation_panel(problems: &[save::Problem]) -> Element<'static, Message> {
 
     let mut rows: Vec<Element<Message>> = vec![text("Validation").size(14).font(BOLD).into()];
     for problem in problems {
-        let (mark, mark_style): (&str, fn(&Theme) -> text::Style) = match problem.severity {
-            Severity::Error => ("✕", danger),
-            Severity::Warning => ("!", warn_style),
-        };
+        let mark = severity_icon(problem.severity);
+        let mark_style = severity_style(problem.severity);
         let mut label_btn = button(text(problem.label.clone()).size(13))
             .padding([2, 6])
             .style(ghost_button);
@@ -1557,668 +1161,15 @@ fn file_diff(file: &save::FileDiff) -> Element<'static, Message> {
     .into()
 }
 
-/// Collections that have full row editors (others are shown read-only).
-fn is_editable(id: CollectionId) -> bool {
-    matches!(
-        id,
-        CollectionId::Keybinds
-            | CollectionId::WindowRules
-            | CollectionId::LayerRules
-            | CollectionId::Monitors
-            | CollectionId::Submaps
-            | CollectionId::Env
-            | CollectionId::Execs
-    )
-}
-
-fn collection_view(app: &App, loaded: &Loaded, id: CollectionId) -> Element<'static, Message> {
-    let (label, description) = app
-        .schema
-        .collection(id)
-        .map(|c| (c.label.clone(), c.description.clone()))
-        .unwrap_or_default();
-
-    let count = collection_count(app, id);
-    let trailing = format!("{count} entr{}", if count == 1 { "y" } else { "ies" });
-
-    let mut items: Vec<Element<Message>> = vec![pane_header(
-        collection_icon(id),
-        label,
-        description,
-        trailing,
-    )];
-
-    if is_editable(id) {
-        items.push(
-            button(text(format!("+ add {}", singular(id))).size(13))
-                .padding([6, 12])
-                .on_press(Message::CollectionEdit(CollectionAction::Add(id)))
-                .style(ghost_button)
-                .into(),
-        );
-        items.extend(collection_rows(loaded, id, count));
-        if count == 0 {
-            items.push(
-                container(text("No entries yet.").size(13).style(muted))
-                    .padding([8, 4])
-                    .into(),
-            );
-        }
-    } else {
-        // Read-only collections (workspaces / beziers / animations) for now.
-        let lines = collection_lines(loaded, id);
-        if lines.is_empty() {
-            items.push(
-                container(
-                    text("No entries in this configuration.")
-                        .size(13)
-                        .style(muted),
-                )
-                .padding([10, 14])
-                .into(),
-            );
-        }
-        for line in lines {
-            items.push(
-                container(text(line).size(13))
-                    .padding([8, 14])
-                    .width(Length::Fill)
-                    .style(card_style)
-                    .into(),
-            );
-        }
-    }
-
-    scroll(items)
-}
-
-fn singular(id: CollectionId) -> &'static str {
-    match id {
-        CollectionId::Keybinds => "keybind",
-        CollectionId::WindowRules => "window rule",
-        CollectionId::LayerRules => "layer rule",
-        CollectionId::Monitors => "monitor",
-        CollectionId::Submaps => "submap",
-        CollectionId::Env => "variable",
-        CollectionId::Execs => "command",
-        _ => "entry",
-    }
-}
-
-fn collection_rows(
-    loaded: &Loaded,
-    id: CollectionId,
-    count: usize,
-) -> Vec<Element<'static, Message>> {
-    let c = &loaded.config;
-    match id {
-        CollectionId::Keybinds => c
-            .keybinds
-            .iter()
-            .enumerate()
-            .map(|(i, t)| keybind_row(i, &t.value, count))
-            .collect(),
-        CollectionId::WindowRules => c
-            .window_rules
-            .iter()
-            .enumerate()
-            .map(|(i, t)| window_rule_row(i, &t.value, count))
-            .collect(),
-        CollectionId::LayerRules => c
-            .layer_rules
-            .iter()
-            .enumerate()
-            .map(|(i, t)| layer_rule_row(i, &t.value, count))
-            .collect(),
-        CollectionId::Monitors => c
-            .monitors
-            .iter()
-            .enumerate()
-            .map(|(i, t)| monitor_row(i, &t.value, count))
-            .collect(),
-        CollectionId::Submaps => c
-            .submaps
-            .iter()
-            .enumerate()
-            .map(|(i, t)| submap_row(i, &t.value, count))
-            .collect(),
-        CollectionId::Env => c
-            .env
-            .iter()
-            .enumerate()
-            .map(|(i, t)| env_row(i, &t.value, count))
-            .collect(),
-        CollectionId::Execs => c
-            .execs
-            .iter()
-            .enumerate()
-            .map(|(i, t)| exec_row(i, &t.value, count))
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// The shared per-row control strip: index, reorder, duplicate, remove + issue.
-fn row_controls(
-    id: CollectionId,
-    i: usize,
-    count: usize,
-    issue: Option<String>,
-) -> Element<'static, Message> {
-    let up = icon_button(
-        "↑",
-        (i > 0).then(|| Message::CollectionEdit(CollectionAction::Move(id, i, Dir::Up))),
-    );
-    let down = icon_button(
-        "↓",
-        (i + 1 < count).then(|| Message::CollectionEdit(CollectionAction::Move(id, i, Dir::Down))),
-    );
-    let dup = icon_button(
-        "⧉",
-        Some(Message::CollectionEdit(CollectionAction::Duplicate(id, i))),
-    );
-    let del = icon_button(
-        "✕",
-        Some(Message::CollectionEdit(CollectionAction::Remove(id, i))),
-    );
-
-    let mut controls = row![
-        text(format!("#{}", i + 1)).size(12).style(muted),
-        up,
-        down,
-        dup,
-        Space::new().width(Length::Fill),
-    ]
-    .spacing(4)
-    .align_y(Alignment::Center);
-
-    if let Some(issue) = issue {
-        controls = controls.push(text(format!("⚠ {issue}")).size(11).style(danger));
-    }
-    controls = controls.push(del);
-    controls.into()
-}
-
-fn icon_button(label: &'static str, message: Option<Message>) -> Element<'static, Message> {
-    let mut b = button(text(label).size(13))
-        .padding([2, 7])
-        .style(ghost_button);
-    if let Some(m) = message {
-        b = b.on_press(m);
-    }
-    b.into()
-}
-
-fn row_card(
-    controls: Element<'static, Message>,
-    body: Element<'static, Message>,
-) -> Element<'static, Message> {
-    container(column![controls, body].spacing(10))
-        .padding([12, 14])
-        .width(Length::Fill)
-        .style(card_style)
-        .into()
-}
-
-fn coll_text(
-    value: &str,
-    placeholder: &'static str,
-    width: Length,
-    make: impl Fn(String) -> Message + 'static,
-) -> Element<'static, Message> {
-    text_input(placeholder, value)
-        .on_input(make)
-        .padding([6, 8])
-        .size(14)
-        .width(width)
-        .into()
-}
-
-fn chip(label: String, active: bool, message: Message) -> Element<'static, Message> {
-    button(text(label).size(12))
-        .padding([3, 9])
-        .on_press(message)
-        .style(move |theme: &Theme, status| chip_style(theme, status, active))
-        .into()
-}
-
-fn keybind_row(i: usize, kb: &Keybind, count: usize) -> Element<'static, Message> {
-    let mods = row(MODS.iter().map(|&name| {
-        let active = has_mod(&kb.mods, name);
-        chip(
-            name.to_string(),
-            active,
-            Message::CollectionEdit(CollectionAction::Keybind(
-                i,
-                KeybindEdit::ToggleMod(name.to_string(), !active),
-            )),
-        )
-    }))
-    .spacing(6);
-
-    let key = coll_text(&kb.key, "key", Length::Fixed(110.0), move |s| {
-        Message::CollectionEdit(CollectionAction::Keybind(i, KeybindEdit::Key(s)))
-    });
-
-    let mut options: Vec<String> = DISPATCHERS.iter().map(|s| s.to_string()).collect();
-    if !options.contains(&kb.dispatcher) && !kb.dispatcher.is_empty() {
-        options.insert(0, kb.dispatcher.clone());
-    }
-    let dispatcher = pick_list(options, Some(kb.dispatcher.clone()), move |d| {
-        Message::CollectionEdit(CollectionAction::Keybind(i, KeybindEdit::Dispatcher(d)))
-    })
-    .text_size(14)
-    .padding([6, 10])
-    .width(Length::Fixed(200.0));
-
-    let args = coll_text(&kb.args, "arguments", Length::Fill, move |s| {
-        Message::CollectionEdit(CollectionAction::Keybind(i, KeybindEdit::Args(s)))
-    });
-
-    let flags = row![
-        flag_chip(i, "m", BindFlag::Mouse, kb.flags.mouse),
-        flag_chip(i, "e", BindFlag::Repeat, kb.flags.repeat),
-        flag_chip(i, "r", BindFlag::Release, kb.flags.release),
-        flag_chip(i, "l", BindFlag::Locked, kb.flags.locked),
-        flag_chip(i, "n", BindFlag::NonConsuming, kb.flags.non_consuming),
-        flag_chip(i, "t", BindFlag::Transparent, kb.flags.transparent),
-        flag_chip(i, "i", BindFlag::IgnoreMods, kb.flags.ignore_mods),
-        Space::new().width(Length::Fill),
-        text("submap").size(12).style(muted),
-        coll_text(
-            kb.submap.as_deref().unwrap_or(""),
-            "global",
-            Length::Fixed(130.0),
-            move |s| Message::CollectionEdit(CollectionAction::Keybind(i, KeybindEdit::Submap(s))),
-        ),
-    ]
-    .spacing(6)
-    .align_y(Alignment::Center);
-
-    let body = column![
-        mods,
-        row![key, dispatcher, args]
-            .spacing(8)
-            .align_y(Alignment::Center),
-        flags,
-    ]
-    .spacing(8);
-
-    row_card(
-        row_controls(CollectionId::Keybinds, i, count, keybind_issue(kb)),
-        body.into(),
-    )
-}
-
-fn flag_chip(
-    i: usize,
-    label: &'static str,
-    flag: BindFlag,
-    active: bool,
-) -> Element<'static, Message> {
-    chip(
-        label.to_string(),
-        active,
-        Message::CollectionEdit(CollectionAction::Keybind(
-            i,
-            KeybindEdit::Flag(flag, !active),
-        )),
-    )
-}
-
-fn window_rule_row(i: usize, wr: &WindowRule, count: usize) -> Element<'static, Message> {
-    let v2 = chip(
-        "v2".to_string(),
-        wr.v2,
-        Message::CollectionEdit(CollectionAction::WindowRule(i, WindowRuleEdit::V2(!wr.v2))),
-    );
-    let rule = coll_text(
-        &wr.rule,
-        "rule (e.g. float, opacity 0.9)",
-        Length::Fill,
-        move |s| Message::CollectionEdit(CollectionAction::WindowRule(i, WindowRuleEdit::Rule(s))),
-    );
-
-    let mut match_rows: Vec<Element<Message>> = Vec::new();
-    for (mi, (key, value)) in parse_matchers(&wr.matchers).into_iter().enumerate() {
-        let k = coll_text(
-            &key,
-            "class / title / …",
-            Length::Fixed(150.0),
-            move |s| {
-                Message::CollectionEdit(CollectionAction::WindowRule(
-                    i,
-                    WindowRuleEdit::MatchKey(mi, s),
-                ))
-            },
-        );
-        let v = coll_text(&value, "match value", Length::Fill, move |s| {
-            Message::CollectionEdit(CollectionAction::WindowRule(
-                i,
-                WindowRuleEdit::MatchValue(mi, s),
-            ))
-        });
-        let del = icon_button(
-            "✕",
-            Some(Message::CollectionEdit(CollectionAction::WindowRule(
-                i,
-                WindowRuleEdit::RemoveMatch(mi),
-            ))),
-        );
-        match_rows.push(
-            row![k, text(":").size(13).style(muted), v, del]
-                .spacing(6)
-                .align_y(Alignment::Center)
-                .into(),
-        );
-    }
-    let add_match = button(text("+ match criterion").size(12))
-        .padding([4, 10])
-        .on_press(Message::CollectionEdit(CollectionAction::WindowRule(
-            i,
-            WindowRuleEdit::AddMatch,
-        )))
-        .style(ghost_button);
-
-    // Raw escape hatch for v1 regexes / matchers with commas the builder can't model.
-    let raw = coll_text(&wr.matchers, "raw matchers", Length::Fill, move |s| {
-        Message::CollectionEdit(CollectionAction::WindowRule(i, WindowRuleEdit::Matchers(s)))
-    });
-
-    let body = column![
-        row![text("type").size(12).style(muted), v2, rule]
-            .spacing(8)
-            .align_y(Alignment::Center),
-        text("match criteria").size(12).style(muted),
-        Column::with_children(match_rows).spacing(6),
-        add_match,
-        row![text("raw").size(12).style(muted), raw]
-            .spacing(8)
-            .align_y(Alignment::Center),
-    ]
-    .spacing(8);
-
-    row_card(
-        row_controls(CollectionId::WindowRules, i, count, window_rule_issue(wr)),
-        body.into(),
-    )
-}
-
-fn layer_rule_row(i: usize, lr: &LayerRule, count: usize) -> Element<'static, Message> {
-    let rule = coll_text(
-        &lr.rule,
-        "rule (e.g. blur)",
-        Length::Fixed(220.0),
-        move |s| Message::CollectionEdit(CollectionAction::LayerRule(i, LayerRuleEdit::Rule(s))),
-    );
-    let ns = coll_text(
-        &lr.namespace,
-        "namespace (e.g. waybar)",
-        Length::Fill,
-        move |s| {
-            Message::CollectionEdit(CollectionAction::LayerRule(i, LayerRuleEdit::Namespace(s)))
-        },
-    );
-    let body = row![rule, text("⟵").size(13).style(muted), ns]
-        .spacing(8)
-        .align_y(Alignment::Center);
-    row_card(
-        row_controls(CollectionId::LayerRules, i, count, layer_rule_issue(lr)),
-        body.into(),
-    )
-}
-
-/// A labelled dropdown for a fixed-choice collection field (e.g. a monitor
-/// transform). Always offers an explicit "(unset)" entry and keeps any unknown
-/// current value selectable, mirroring [`enum_editor`].
-fn coll_choice(
-    label: &'static str,
-    current: String,
-    variants: &[(&str, &str)],
-    width: f32,
-    on_select: impl Fn(String) -> Message + 'static,
-) -> Element<'static, Message> {
-    let mut choices = vec![EnumChoice {
-        value: String::new(),
-        label: "(unset)".to_string(),
-    }];
-    for (value, desc) in variants {
-        choices.push(EnumChoice {
-            value: (*value).to_string(),
-            label: format!("{value}  ·  {desc}"),
-        });
-    }
-    if !choices.iter().any(|c| c.value == current) {
-        choices.push(EnumChoice {
-            value: current.clone(),
-            label: current.clone(),
-        });
-    }
-    let selected = choices.iter().find(|c| c.value == current).cloned();
-    column![
-        text(label).size(11).style(muted),
-        pick_list(choices, selected, move |c: EnumChoice| on_select(c.value))
-            .padding([6, 8])
-            .text_size(14)
-            .width(Length::Fixed(width)),
-    ]
-    .spacing(2)
-    .width(Length::Fixed(width))
-    .into()
-}
-
-fn monitor_row(i: usize, m: &MonitorRule, count: usize) -> Element<'static, Message> {
-    let field = |label: &'static str,
-                 value: String,
-                 placeholder: &'static str,
-                 make: fn(String) -> MonitorEdit| {
-        column![
-            text(label).size(11).style(muted),
-            text_input(placeholder, &value)
-                .on_input(move |s| Message::CollectionEdit(CollectionAction::Monitor(i, make(s))))
-                .padding([6, 8])
-                .size(14),
-        ]
-        .spacing(2)
-    };
-
-    let body = column![
-        row![
-            field(
-                "connector",
-                m.name.clone(),
-                "DP-1 / desc:…",
-                MonitorEdit::Name
-            )
-            .width(Length::FillPortion(2)),
-            field("mode", m.mode.clone(), "1920x1080@144", MonitorEdit::Mode)
-                .width(Length::FillPortion(2)),
-        ]
-        .spacing(10),
-        row![
-            field(
-                "position",
-                m.position.clone(),
-                "0x0 / auto",
-                MonitorEdit::Position
-            )
-            .width(Length::FillPortion(2)),
-            field("scale", m.scale.clone(), "1 / auto", MonitorEdit::Scale)
-                .width(Length::Fixed(120.0)),
-            coll_choice(
-                "transform",
-                extra_field(&m.extra, "transform"),
-                &[
-                    ("0", "Normal"),
-                    ("1", "90°"),
-                    ("2", "180°"),
-                    ("3", "270°"),
-                    ("4", "Flipped"),
-                    ("5", "Flipped + 90°"),
-                    ("6", "Flipped + 180°"),
-                    ("7", "Flipped + 270°"),
-                ],
-                170.0,
-                move |s| Message::CollectionEdit(CollectionAction::Monitor(
-                    i,
-                    MonitorEdit::Transform(s)
-                )),
-            ),
-            coll_choice(
-                "vrr",
-                extra_field(&m.extra, "vrr"),
-                &[("0", "Off"), ("1", "On"), ("2", "Fullscreen only")],
-                160.0,
-                move |s| Message::CollectionEdit(CollectionAction::Monitor(i, MonitorEdit::Vrr(s))),
-            ),
-            field(
-                "mirror",
-                extra_field(&m.extra, "mirror"),
-                "DP-2",
-                MonitorEdit::Mirror
-            )
-            .width(Length::Fixed(110.0)),
-        ]
-        .spacing(10),
-    ]
-    .spacing(8);
-
-    row_card(
-        row_controls(CollectionId::Monitors, i, count, monitor_issue(m)),
-        body.into(),
-    )
-}
-
-fn submap_row(i: usize, s: &Submap, count: usize) -> Element<'static, Message> {
-    let name = coll_text(&s.name, "submap name", Length::Fixed(240.0), move |v| {
-        Message::CollectionEdit(CollectionAction::Submap(i, v))
-    });
-    let body = row![text("name").size(12).style(muted), name]
-        .spacing(8)
-        .align_y(Alignment::Center);
-    row_card(
-        row_controls(CollectionId::Submaps, i, count, None),
-        body.into(),
-    )
-}
-
-fn env_row(i: usize, e: &EnvVar, count: usize) -> Element<'static, Message> {
-    let name = coll_text(&e.name, "NAME", Length::Fixed(220.0), move |s| {
-        Message::CollectionEdit(CollectionAction::Env(i, EnvEdit::Name(s)))
-    });
-    let value = coll_text(&e.value, "value", Length::Fill, move |s| {
-        Message::CollectionEdit(CollectionAction::Env(i, EnvEdit::Value(s)))
-    });
-    let body = row![name, text("=").size(13).style(muted), value]
-        .spacing(8)
-        .align_y(Alignment::Center);
-    row_card(
-        row_controls(CollectionId::Env, i, count, env_issue(e)),
-        body.into(),
-    )
-}
-
-fn exec_row(i: usize, e: &Exec, count: usize) -> Element<'static, Message> {
-    let kinds = vec![
-        "exec-once".to_string(),
-        "exec".to_string(),
-        "exec-shutdown".to_string(),
-    ];
-    let current = match e.kind {
-        ExecKind::Exec => "exec",
-        ExecKind::ExecOnce => "exec-once",
-        ExecKind::ExecShutdown => "exec-shutdown",
-    }
-    .to_string();
-    let kind = pick_list(kinds, Some(current), move |label| {
-        let kind = match label.as_str() {
-            "exec" => ExecKind::Exec,
-            "exec-shutdown" => ExecKind::ExecShutdown,
-            _ => ExecKind::ExecOnce,
-        };
-        Message::CollectionEdit(CollectionAction::Exec(i, ExecEdit::Kind(kind)))
-    })
-    .text_size(14)
-    .padding([6, 10])
-    .width(Length::Fixed(150.0));
-
-    let command = coll_text(&e.command, "command", Length::Fill, move |s| {
-        Message::CollectionEdit(CollectionAction::Exec(i, ExecEdit::Command(s)))
-    });
-
-    let body = row![kind, command].spacing(8).align_y(Alignment::Center);
-    row_card(
-        row_controls(CollectionId::Execs, i, count, exec_issue(e)),
-        body.into(),
-    )
-}
-
-fn search_results(app: &App, loaded: &Loaded) -> Element<'static, Message> {
-    let query = app.search.trim();
-
-    let mut scored: Vec<(i32, &str, &OptionSpec)> = Vec::new();
-    for section in app.schema.sections() {
-        for opt in &section.options {
-            if let Some(score) = fuzzy::option_score(query, &opt.label, &opt.path, &opt.description)
-            {
-                scored.push((score, section.id.as_str(), opt));
-            }
-        }
-    }
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.2.path.cmp(&b.2.path)));
-
-    let mut items: Vec<Element<Message>> = vec![text(format!(
-        "{} option{} matching “{query}”",
-        scored.len(),
-        if scored.len() == 1 { "" } else { "s" }
-    ))
-    .size(13)
-    .style(muted)
-    .into()];
-
-    if scored.is_empty() {
-        items.push(text("No matches.").size(15).into());
-    }
-
-    for (_score, section_id, opt) in scored.into_iter().take(300) {
-        let value = match loaded.config.get(&opt.path) {
-            Some(v) => render_value(v),
-            None => render_value(&opt.default),
-        };
-        let inner = row![
-            row![
-                text(section_icon(section_id)).size(13),
-                text(opt.label.clone()).size(14)
-            ]
-            .spacing(8)
-            .width(Length::FillPortion(3)),
-            container(text(value).size(13).style(accent))
-                .width(Length::FillPortion(2))
-                .align_x(Alignment::End),
-        ]
-        .spacing(12)
-        .align_y(Alignment::Center);
-
-        items.push(
-            button(inner)
-                .width(Length::Fill)
-                .padding([8, 14])
-                .on_press(Message::Selected(Selection::Section(
-                    section_id.to_string(),
-                )))
-                .style(result_style)
-                .into(),
-        );
-    }
-
-    scroll(items)
-}
-
 /// A vertical, scrollable, fill-width column.
-fn scroll(items: Vec<Element<'static, Message>>) -> Element<'static, Message> {
+///
+/// Generic over the element lifetime so panes can hand it widgets that *borrow*
+/// from the schema or the loaded config instead of cloning every string they
+/// display into `'static` on each frame.
+pub(super) fn scroll<'a>(items: Vec<Element<'a, Message>>) -> Element<'a, Message> {
     scrollable(
         Column::with_children(items)
-            .spacing(8)
+            .spacing(6)
             .width(Length::Fill)
             .padding([0, 8]),
     )
@@ -2259,33 +1210,67 @@ fn status_bar(app: &App) -> Element<'_, Message> {
             }
             segs = segs.push(Space::new().width(Length::Fill));
             segs = segs.push(hyprland_status(app));
-            if let Some(info) = &app.hyprland {
-                let stale =
-                    hyprconf_core::unsupported_options(app.schema, &loaded.config, &info.version);
-                if !stale.is_empty() {
-                    segs = segs.push(
-                        text(format!("⚠ {} need newer Hyprland", stale.len()))
-                            .size(12)
-                            .style(warn_style),
-                    );
-                }
+            // Counted in `update` when the config or the detected Hyprland
+            // changes — scanning every set option against the schema on every
+            // frame is work nobody asked for.
+            if app.stale_options > 0 {
+                segs = segs.push(
+                    text(format!("⚠ {} need newer Hyprland", app.stale_options))
+                        .size(12)
+                        .style(warn_style),
+                );
             }
             if let Some(status) = &app.save_status {
-                match status {
-                    Ok(msg) => segs = segs.push(text(format!("✓ {msg}")).size(12).style(success)),
-                    Err(msg) => segs = segs.push(text(format!("✕ {msg}")).size(12).style(danger)),
-                }
+                // Clickable: a status line that never goes away becomes noise,
+                // and the user has no other way to acknowledge it.
+                let (label, style): (String, fn(&Theme) -> text::Style) = match status {
+                    Ok(msg) => (format!("✓ {msg}"), success),
+                    Err(msg) => (format!("✕ {msg}"), danger),
+                };
+                segs = segs.push(
+                    button(text(label).size(12).style(style))
+                        .padding([1, 8])
+                        .on_press(Message::DismissStatus)
+                        .style(ghost_button),
+                );
             }
             segs = segs.push(
                 text(format!("{} options set", loaded.config.option_count()))
                     .size(12)
                     .style(muted),
             );
-            if loaded.warnings > 0 {
+            // Lua code hyprconf keeps as-is (loops, helper functions) is not a
+            // problem and must not read like one; only real issues get the ⚠.
+            let code = loaded.dynamic_regions;
+            let issues = loaded.diagnostics.len().saturating_sub(code);
+            if code > 0 {
                 segs = segs.push(
-                    text(format!("⚠ {} warnings", loaded.warnings))
+                    button(
+                        text(format!(
+                            "{code} Lua code block{} kept as-is",
+                            if code == 1 { "" } else { "s" }
+                        ))
                         .size(12)
-                        .style(danger),
+                        .style(muted),
+                    )
+                    .padding([1, 8])
+                    .on_press(Message::ToggleDiagnostics)
+                    .style(ghost_button),
+                );
+            }
+            if issues > 0 {
+                segs = segs.push(
+                    button(
+                        text(format!(
+                            "⚠ {issues} warning{}",
+                            if issues == 1 { "" } else { "s" }
+                        ))
+                        .size(12)
+                        .style(warn_style),
+                    )
+                    .padding([1, 8])
+                    .on_press(Message::ToggleDiagnostics)
+                    .style(ghost_button),
                 );
             }
             segs.into()
@@ -2329,186 +1314,19 @@ fn hyprland_status(app: &App) -> Element<'_, Message> {
     .align_y(Alignment::Center);
 
     if let Some(result) = &app.hypr_status {
-        match result {
-            Ok(_) => strip = strip.push(text("✓").size(12).style(success)),
-            Err(_) => strip = strip.push(text("✕").size(12).style(danger)),
-        }
+        // A bare ✕ tells you nothing; the reason is one hover away.
+        let (glyph, style, detail): (&str, fn(&Theme) -> text::Style, String) = match result {
+            Ok(_) => ("✓", success, "Applied to the running Hyprland".to_string()),
+            Err(e) => ("✕", danger, e.clone()),
+        };
+        strip = strip.push(tooltip(
+            text(glyph).size(12).style(style),
+            container(text(detail).size(12))
+                .padding([6, 10])
+                .max_width(420.0)
+                .style(tooltip_style),
+            tooltip::Position::Top,
+        ));
     }
     strip.into()
-}
-
-// ---------------------------------------------------------------------------
-// value & collection rendering
-// ---------------------------------------------------------------------------
-
-fn render_value(value: &Value) -> String {
-    value_to_conf(value)
-}
-
-fn collection_lines(loaded: &Loaded, id: CollectionId) -> Vec<String> {
-    let c = &loaded.config;
-    match id {
-        CollectionId::Monitors => c.monitors.iter().map(|t| monitor_line(&t.value)).collect(),
-        CollectionId::Workspaces => c
-            .workspaces
-            .iter()
-            .map(|t| workspace_line(&t.value))
-            .collect(),
-        CollectionId::WindowRules => c
-            .window_rules
-            .iter()
-            .map(|t| window_rule_line(&t.value))
-            .collect(),
-        CollectionId::LayerRules => c
-            .layer_rules
-            .iter()
-            .map(|t| layer_rule_line(&t.value))
-            .collect(),
-        CollectionId::Keybinds => c.keybinds.iter().map(|t| keybind_line(&t.value)).collect(),
-        CollectionId::Submaps => c.submaps.iter().map(|t| submap_line(&t.value)).collect(),
-        CollectionId::Env => c.env.iter().map(|t| env_line(&t.value)).collect(),
-        CollectionId::Execs => c.execs.iter().map(|t| exec_line(&t.value)).collect(),
-        CollectionId::Variables => c
-            .variables
-            .iter()
-            .map(|t| variable_line(&t.value))
-            .collect(),
-        CollectionId::Beziers => c.beziers.iter().map(|t| bezier_line(&t.value)).collect(),
-        CollectionId::Animations => c
-            .animations
-            .iter()
-            .map(|t| animation_line(&t.value))
-            .collect(),
-    }
-}
-
-fn keybind_line(k: &Keybind) -> String {
-    let mods = if k.mods.is_empty() {
-        String::new()
-    } else {
-        format!("{} ", k.mods)
-    };
-    let args = if k.args.is_empty() {
-        String::new()
-    } else {
-        format!(" {}", k.args)
-    };
-    let submap = k
-        .submap
-        .as_ref()
-        .map(|s| format!("   [submap: {s}]"))
-        .unwrap_or_default();
-    format!(
-        "{} · {mods}{} → {}{args}{submap}",
-        k.flags.keyword(),
-        k.key,
-        k.dispatcher
-    )
-}
-
-fn window_rule_line(r: &WindowRule) -> String {
-    let kw = if r.v2 { "windowrulev2" } else { "windowrule" };
-    format!("{kw} · {}  ⟵  {}", r.rule, r.matchers)
-}
-
-fn layer_rule_line(r: &LayerRule) -> String {
-    format!("{}  ⟵  {}", r.rule, r.namespace)
-}
-
-fn monitor_line(m: &MonitorRule) -> String {
-    let name = if m.name.is_empty() { "(all)" } else { &m.name };
-    let extra = if m.extra.is_empty() {
-        String::new()
-    } else {
-        format!("  {}", m.extra.join(", "))
-    };
-    format!("{name}: {} @ {} ×{}{extra}", m.mode, m.position, m.scale)
-}
-
-fn workspace_line(w: &WorkspaceRule) -> String {
-    format!("{}: {}", w.selector, w.rules)
-}
-
-fn env_line(e: &EnvVar) -> String {
-    format!("{} = {}", e.name, e.value)
-}
-
-fn exec_line(e: &Exec) -> String {
-    let kind = match e.kind {
-        ExecKind::Exec => "exec",
-        ExecKind::ExecOnce => "exec-once",
-        ExecKind::ExecShutdown => "exec-shutdown",
-    };
-    format!("{kind} · {}", e.command)
-}
-
-fn submap_line(s: &Submap) -> String {
-    s.name.clone()
-}
-
-fn variable_line(v: &Variable) -> String {
-    format!("${} = {}", v.name, v.value)
-}
-
-fn bezier_line(b: &Bezier) -> String {
-    format!(
-        "{}: ({}, {}) ({}, {})",
-        b.name, b.p0.x, b.p0.y, b.p1.x, b.p1.y
-    )
-}
-
-fn animation_line(a: &Animation) -> String {
-    let onoff = if a.enabled { "on" } else { "off" };
-    let style = a
-        .style
-        .as_deref()
-        .map(|s| format!(", {s}"))
-        .unwrap_or_default();
-    format!("{}: {onoff}, speed {}, {}{style}", a.name, a.speed, a.curve)
-}
-
-// ---------------------------------------------------------------------------
-// icons
-// ---------------------------------------------------------------------------
-
-fn section_icon(id: &str) -> &'static str {
-    match id {
-        "general" => "🪟",
-        "decoration" => "🎨",
-        "animations" => "✨",
-        "input" => "⌨",
-        "gestures" => "✋",
-        "group" => "🗂",
-        "misc" => "🧩",
-        "binds" => "🎹",
-        "dwindle" => "🌿",
-        "master" => "📐",
-        "xwayland" => "🩹",
-        "cursor" => "🖱",
-        "render" => "🖼",
-        "debug" => "🐞",
-        "layout" => "🧱",
-        "scrolling" => "📜",
-        "opengl" => "🧊",
-        "ecosystem" => "🌱",
-        "experimental" => "🧪",
-        "quirks" => "🔧",
-        _ => "•",
-    }
-}
-
-fn collection_icon(id: CollectionId) -> &'static str {
-    match id {
-        CollectionId::Monitors => "🖥",
-        CollectionId::Workspaces => "🔳",
-        CollectionId::WindowRules => "📏",
-        CollectionId::LayerRules => "🧅",
-        CollectionId::Keybinds => "⌨",
-        CollectionId::Submaps => "🗺",
-        CollectionId::Env => "🌐",
-        CollectionId::Execs => "▶",
-        CollectionId::Variables => "🔣",
-        CollectionId::Beziers => "〰",
-        CollectionId::Animations => "🎞",
-    }
 }

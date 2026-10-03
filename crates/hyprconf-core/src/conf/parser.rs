@@ -415,6 +415,11 @@ fn is_directive_keyword(key: &str) -> bool {
         "submap",
         "plugin",
         "permission",
+        // Repeatable in 0.56 (`gesture = 3, horizontal, workspace`); treating it
+        // as a scalar option makes every gesture but the last vanish.
+        "gesture",
+        // `p` = fire even while an app inhibits shortcuts.
+        "gesturep",
     ];
     if FIXED.contains(&key) {
         return true;

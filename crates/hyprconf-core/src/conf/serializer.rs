@@ -46,24 +46,50 @@ pub fn config_to_conf(config: &Config) -> String {
     }
     blank(&mut out, !config.variables.is_empty());
 
+    // Plugins first: their own options (in `plugin { … }`) only exist once the
+    // plugin is loaded.
+    for p in &config.plugins {
+        let _ = writeln!(out, "plugin = {}", p.value.path);
+    }
+    blank(&mut out, !config.plugins.is_empty());
+
     for (path, tracked) in &config.options {
-        let _ = writeln!(out, "{path} = {}", value_to_conf(&tracked.value));
+        let _ = writeln!(
+            out,
+            "{} = {}",
+            crate::schema::conf_path(path),
+            value_to_conf(&tracked.value)
+        );
     }
     blank(&mut out, !config.options.is_empty());
+
+    for d in &config.devices {
+        let _ = writeln!(out, "device {{\n    name = {}", d.value.name);
+        for (key, value) in &d.value.options {
+            let _ = writeln!(out, "    {} = {value}", crate::schema::conf_path(key));
+        }
+        let _ = writeln!(out, "}}");
+    }
+    blank(&mut out, !config.devices.is_empty());
+
+    for g in &config.gestures {
+        let _ = writeln!(
+            out,
+            "{} = {}",
+            g.value.keyword(),
+            g.value.to_keyword_value()
+        );
+    }
+    for p in &config.permissions {
+        let p = &p.value;
+        let _ = writeln!(out, "permission = {}, {}, {}", p.binary, p.kind, p.mode);
+    }
 
     for e in &config.env {
         let _ = writeln!(out, "env = {}, {}", e.value.name, e.value.value);
     }
     for m in &config.monitors {
-        let m = &m.value;
-        let mut fields = vec![
-            m.name.clone(),
-            m.mode.clone(),
-            m.position.clone(),
-            m.scale.clone(),
-        ];
-        fields.extend(m.extra.iter().cloned());
-        let _ = writeln!(out, "monitor = {}", fields.join(", "));
+        let _ = writeln!(out, "monitor = {}", m.value.to_keyword_value());
     }
     for w in &config.workspaces {
         let _ = writeln!(out, "workspace = {}, {}", w.value.selector, w.value.rules);
@@ -146,13 +172,12 @@ fn write_keybinds(out: &mut String, config: &Config) {
 }
 
 fn keybind_line(kb: &Keybind) -> String {
-    let mut line = format!(
-        "{} = {}, {}, {}",
-        kb.flags.keyword(),
-        kb.mods,
-        kb.key,
-        kb.dispatcher
-    );
+    let mut line = format!("{} = {}, {}, ", kb.keyword(), kb.mods, kb.key);
+    if let Some(description) = &kb.description {
+        // Commas would shift every following field.
+        let _ = write!(line, "{}, ", description.replace(',', ";"));
+    }
+    line.push_str(&kb.dispatcher);
     if !kb.args.is_empty() {
         let _ = write!(line, ", {}", kb.args);
     }
@@ -181,6 +206,7 @@ pub fn value_to_conf(value: &Value) -> String {
         Value::String(s) => s.clone(),
         Value::Enum(name) => name.clone(),
         Value::Vec2(v) => v.to_hyprland_string(),
+        Value::CssGap(g) => g.to_hyprland_string(),
     }
 }
 
@@ -213,6 +239,7 @@ mod tests {
             dispatcher: "killactive".into(),
             args: String::new(),
             submap: None,
+            description: None,
         }));
         config.window_rules.push(Tracked::new(WindowRule {
             v2: true,

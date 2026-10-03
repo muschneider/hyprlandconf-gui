@@ -9,7 +9,7 @@
 //! "dynamic" and leaves to the lossless document.
 
 use full_moon::ast::{
-    Call, Expression, Field, FunctionArgs, FunctionCall, Index, Prefix, Stmt, Suffix,
+    Block, Call, Expression, Field, FunctionArgs, FunctionCall, Index, Prefix, Stmt, Suffix,
     TableConstructor, UnOp,
 };
 use full_moon::tokenizer::{TokenReference, TokenType};
@@ -27,6 +27,17 @@ pub(crate) enum LuaVal {
     Nil,
     /// A table constructor, fields in source order.
     Table(Vec<LuaField>),
+    /// A nested call, e.g. the `hl.dsp.window.close()` argument of `hl.bind`.
+    ///
+    /// Dispatchers are *objects built by calling a constructor*, so a Lua
+    /// reader that only understood literals could not see a bind's action at
+    /// all.
+    Call {
+        /// The dotted callee, e.g. `hl.dsp.window.close`.
+        path: String,
+        /// The call's arguments.
+        args: Vec<LuaVal>,
+    },
     /// Anything outside the declarative subset.
     Other,
 }
@@ -82,8 +93,66 @@ pub(crate) fn expr_to_luaval(expr: &Expression) -> LuaVal {
             LuaVal::Num(n) => LuaVal::Num(format!("-{n}")),
             _ => LuaVal::Other,
         },
+        Expression::FunctionCall(fc) => match callee_path(fc) {
+            Some((path, args)) => LuaVal::Call { path, args },
+            None => LuaVal::Other,
+        },
         _ => LuaVal::Other,
     }
+}
+
+/// If `fc` is `callee(<literal>, function(...) <block> end)`, return the callee,
+/// the leading literal (if any) and the function body.
+///
+/// This is how `hl.on("hyprland.start", function() ... end)` and
+/// `hl.define_submap("resize", function() ... end)` are read: their contents are
+/// ordinary declarative statements, just nested one level down.
+pub(crate) fn callback_call(fc: &FunctionCall) -> Option<(String, Option<String>, &Block)> {
+    let mut parts = Vec::new();
+    match fc.prefix() {
+        Prefix::Name(tr) => parts.push(ident_text(tr)?),
+        _ => return None,
+    }
+
+    let mut arguments = None;
+    for suffix in fc.suffixes() {
+        match suffix {
+            Suffix::Index(Index::Dot { name, .. }) => {
+                if arguments.is_some() {
+                    return None;
+                }
+                parts.push(ident_text(name)?);
+            }
+            Suffix::Call(Call::AnonymousCall(FunctionArgs::Parentheses {
+                arguments: a, ..
+            })) => {
+                if arguments.is_some() {
+                    return None;
+                }
+                arguments = Some(a);
+            }
+            _ => return None,
+        }
+    }
+
+    let arguments = arguments?;
+    let mut leading = None;
+    let mut body = None;
+    for expr in arguments {
+        if let Expression::Function(f) = expr {
+            body = Some(f.body().block());
+            continue;
+        }
+        if leading.is_none() {
+            leading = match expr_to_luaval(expr) {
+                LuaVal::Str(s) => Some(s),
+                LuaVal::Num(n) => Some(n),
+                _ => None,
+            };
+        }
+    }
+
+    Some((parts.join("."), leading, body?))
 }
 
 fn table_to_luaval(tc: &TableConstructor) -> LuaVal {

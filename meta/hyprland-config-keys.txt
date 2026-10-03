@@ -166,6 +166,7 @@ group.groupbar.col.active
 group.groupbar.col.inactive
 group.groupbar.col.locked_active
 group.groupbar.col.locked_inactive
+group.groupbar.disable_when_only
 group.groupbar.enabled
 group.groupbar.font_family
 group.groupbar.font_size
@@ -259,6 +260,8 @@ input.touchpad.tap_button_map
 input.touchpad.tap_to_click
 input.virtualkeyboard.release_pressed_on_close
 input.virtualkeyboard.share_states
+input_capture.capture_modifiers
+input_capture.enforce_barriers
 layout.single_window_aspect_ratio
 layout.single_window_aspect_ratio_tolerance
 master.allow_small_split
@@ -296,6 +299,7 @@ misc.exit_window_retains_fullscreen
 misc.focus_on_activate
 misc.font_family
 misc.force_default_wallpaper
+misc.initial_workspace_token_timeout
 misc.initial_workspace_tracking
 misc.key_press_enables_dpms
 misc.layers_hog_keyboard_focus
@@ -307,6 +311,7 @@ misc.name_vk_after_proc
 misc.on_focus_under_fullscreen
 misc.render_unfocused_fps
 misc.screencopy_force_8b
+misc.session_lock_blur
 misc.session_lock_xray
 misc.size_limits_tiled
 misc.splash_font_family

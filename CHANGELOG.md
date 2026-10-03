@@ -7,6 +7,178 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — a reorganised, more direct editor
+
+- **Task-oriented sidebar.** Sections and lists are grouped by what you are
+  doing — *Look & feel, Layouts, Input, Keyboard shortcuts, Windows &
+  workspaces, Displays, Startup, System* — instead of the internal
+  "sections vs collections" split. A test guarantees every section and list
+  appears exactly once.
+- **Grouped option cards.** Each section is split into cards by sub-section
+  (Blur, Shadow, Group bar, Colors, …) with compact rows; labels drop the
+  redundant prefix inside their group ("Blur size" → "Size").
+- **Descriptions inline**, not behind an `ⓘ` hover; the option path is shown
+  faintly for reference.
+- **Editors shaped by type:** small enums are one-click segmented controls
+  (numeric modes show their meaning — *Disabled / Follow / Detached*, not
+  *0 / 1 / 2*); numbers get a slider **and** −/+ steppers with sensible steps;
+  gradients get a live preview bar, swatch stops and an angle slider; gaps can
+  be linked (one value) or split per side; open choices (layout, font weight,
+  SDR transfer function) offer suggestions *and* accept any custom value.
+- **Lists are scannable.** Every entry is a one-line summary (keycaps for
+  binds, `effect for target` for rules, a curve thumbnail for beziers, …) that
+  expands into its editor; a filter box appears on longer lists; new entries
+  open ready to edit.
+- **Pick-lists instead of free text** wherever Hyprland has a fixed vocabulary:
+  62 dispatchers (each with a description and argument hint), window/layer
+  rule effects, window-rule matcher keys, workspace-rule keys, gesture
+  directions and actions, device options, permission types, animation targets.
+  Bind flags are labelled (*repeat, on release, when locked, …*), not letters.
+- **Pending changes:** each entry now *reverts to the file's value*; the
+  per-option ↺ still resets to Hyprland's default.
+- The live-apply ✓/✕ shows the actual `hyprctl` reply on hover.
+
+### Added — every remaining part of the configuration
+
+- **New editable lists:** gesture bindings (`gesture`/`gesturep`), per-device
+  blocks (`device { … }`), permissions, plugins — plus full editors for the
+  previously read-only workspace rules, variables, bezier curves (with a live
+  curve preview) and animations.
+- **Keybinds:** the description (`bindd` / `description = …`) and the `o`
+  (long press), `c` (click), `g` (drag) and `p` (bypass inhibitors) flags.
+- **Options:** `group:groupbar:disable_when_only`, `misc:session_lock_blur`,
+  `misc:initial_workspace_token_timeout`, and the `input-capture` section.
+  The schema now covers **all 353 options** Hyprland 0.56 describes.
+- **Per-side gaps** (`gaps_in = 5 10`, `{ top, right, bottom, left }` in Lua)
+  as a real value type; they used to be integers, so per-side values failed
+  to load.
+- **Overshadowed gestures** are flagged (Hyprland ignores a gesture whose
+  fingers, modifiers and direction an earlier one already covers), and new
+  gestures start on a free combination.
+- `meta/hyprland-descriptions.json` (vendored `hyprctl descriptions -j`) and
+  tests that fail when the schema's coverage, enum values or defaults drift
+  from it. `meta/gen_sliders.py` regenerates it and the slider hints;
+  `just refresh-descriptions` / `just shots` (headless screenshots) recipes.
+
+### Fixed
+
+- **Saving a Lua config no longer rewrites it.** Settings edits on a
+  hand-written `hyprland.lua` used to *regenerate* the file, deleting every
+  loop, helper function and comment (on a real 580-line config: 144 lines
+  left). They now go into a fenced, self-updating `hl.config` block at the
+  end of the file and nothing else is touched. Edits that do require
+  regeneration (list edits) now need explicit consent when code would be lost.
+- **Live-apply works on Lua sessions.** Hyprland refuses `hyprctl keyword`
+  when running a Lua config — with exit status 0, so hyprconf reported
+  success while nothing changed. It now falls back to `hyprctl eval` with the
+  equivalent `hl.config` / `hl.monitor` call; `hyprctl` errors printed on
+  stdout are no longer lost.
+- **Gradient borders in Lua were dropped.** `col = { active_border = { colors
+  = …, angle = 45 } }` — the shape Hyprland's own example uses — was read as
+  a bogus `general:col:active_border:angle` option.
+- **Gestures and devices overwrote each other** (stored as flat `gesture:*` /
+  `device:*` options); several `device { … }` blocks collapsed into one.
+- **`.conf` spellings:** `tap-to-click`, `tap-and-drag` and `input-capture`
+  were unknown options; Hyprland rejects the Lua spellings in `.conf` and vice
+  versa, so both are now mapped in each direction (files and `hyprctl`).
+- **Wrong types and defaults vs Hyprland 0.56:** shadow and glow colours are
+  gradients; `drag_lock` is a 3-way mode, not a boolean; `general:layout`
+  accepts custom `lua:<name>` layouts; font weights accept numbers; corrected
+  defaults for blur brightness, splash colour, locked group borders, inactive
+  shadow/glow colours and `wp_cm_1_2`.
+- `no_hardware_cursors = true` (a boolean on an integer mode, accepted by
+  Hyprland) failed validation and blocked saving; it now reads as `1`.
+- **Reset to default was lost on save** for values the file sets (it marked
+  the option clean); it is now an ordinary, saveable edit.
+- The keybind editor no longer flags `bindm … movewindow` as missing
+  arguments.
+
+### Fixed — the generated Lua now actually loads (Hyprland 0.56)
+
+The Lua serializer was written against the `hl` API as documented in the 0.55.2
+type stub, but several of its shapes are rejected — or, worse, *silently
+ignored* — by the real compositor. Every shape below was re-derived by probing
+Hyprland 0.56.1 with `Hyprland --verify-config`; converting a representative
+`.conf` previously produced **7 load errors**, and now produces none.
+
+- **Keybinds.** `hl.bind("SUPER, Q", "killactive")` failed twice over: chords use
+  `+` (*"Unknown keysym … did you forget a `+`?"*) and the dispatcher must be a
+  real `HL.Dispatcher` object, not a string (*"dispatcher must be a dispatcher
+  (e.g. `hl.dsp.window.close()`)"*). There is deliberately no dispatch-by-name
+  escape hatch — `hl.dispatch("togglesplit")` is rejected identically — so the
+  new `lua::dispatch` module maps all ~50 hyprlang dispatchers onto their
+  `hl.dsp.*` constructors *and their argument shapes*, both directions.
+  Dispatchers with no native equivalent (plugin verbs) fall back to a working
+  `hyprctl dispatch` shim and are reported rather than dropped.
+- **Modifier separators.** `SUPER_SHIFT` (what Hyprland's own generator emits) is
+  now split into `SUPER + SHIFT`; underscores in key names are left alone.
+- **Gradients.** The `.conf` string form (`rgba(a) rgba(b) 45deg`) is rejected by
+  the Lua colour parser; multi-stop gradients now emit
+  `{ colors = { … }, angle = 45 }`.
+- **Window/layer rules.** The rule has to be a *field* (`float = true`), not the
+  `name` (which is only a handle for `set_enabled`). The previous output loaded
+  perfectly happily and applied **no rules at all** — the worst failure mode
+  available. The new `lua::rules` module maps rule text to typed fields in both
+  directions, using a field list enumerated from the compositor.
+- **Workspace rules** are flat fields, not a `rules` string (which is a hard
+  error: *"unknown field 'rules'"*).
+- **Bezier curves and animations** use the table forms
+  `hl.curve(name, { type = "bezier", points = { … } })` and
+  `hl.animation({ leaf, enabled, speed, bezier, style })`; the positional forms
+  are rejected.
+- **`exec-once`** is emitted inside `hl.on("hyprland.start", …)` so it runs once
+  instead of on every reload (and does not fire during verification).
+- **Submaps** use `hl.define_submap(name, function() … end)`.
+- **`windowrule { … }` / `layerrule { … }` blocks** (the form Hyprland's own
+  0.56 configs use) were parsed as *settings sections*, turning every rule into a
+  bogus `windowrule:float` option — the rules vanished while the output still
+  reported "config ok". They are now real rules, and rules sharing a matcher are
+  merged back into a single `hl.window_rule` call. On a representative real-world
+  config this recovered **25 silently-dropped rules**.
+- **`gesture` and `device { … }`** are converted to `hl.gesture` / `hl.device`
+  instead of being emitted as unknown `hl.config` keys (a hard error). Repeated
+  `gesture` lines no longer overwrite each other.
+- **Boolean leniency.** hyprlang only inspects a boolean's first token, which is
+  why Hyprland's stock config can write `enabled = yes, please :)`. That now
+  parses as `true` rather than becoming a string Lua rejects. Integer "mode"
+  options written as `true`/`false` stay unquoted.
+
+### Added — guided `.conf` → Lua migration
+
+Hyprland 0.56 announces that `.conf` support ends in 0.57, so every `.conf` user
+has to migrate — usually once, under time pressure, to the file that decides
+whether their desktop still works.
+
+- A dismissible **deprecation banner** (with the running Hyprland version) and a
+  persistent *→ Lua* toolbar button.
+- A four-step flow — **Review → Preview → Check → Apply** — reachable from the
+  banner, the toolbar, or the new `--migrate` flag.
+- **Check** is the point of the whole thing: `hyprconf-core::verify` runs
+  `Hyprland --verify-config` on the generated file in a temp directory and shows
+  the compositor's own verdict. Writing is blocked unless it passes or the user
+  explicitly overrides. Top-level `exec` calls are commented out for the check so
+  verification never launches the user's autostart.
+- Anything the Lua API cannot express exactly is surfaced as a `LuaNote` on the
+  review step instead of being dropped silently.
+- Applying backs up whatever it replaces, **keeps the original `.conf`**
+  (Hyprland prefers `.lua` when both exist, so rollback is deleting one file),
+  and re-opens the editor against the new file.
+
+### Added — machine-checked conversion tests
+
+- `tests/hyprland_verify.rs` converts representative `.conf` fixtures and asserts
+  the **real Hyprland binary** accepts the result. These skip themselves when no
+  Hyprland is installed, so CI stays green.
+- Headless UI tests drive the whole migration flow, including re-opening the
+  written file.
+
+### Changed
+
+- Vendored Hyprland metadata updated to **0.56.1** (353 config keys).
+- `Ctrl+F` focuses the search field; the header no longer collapses the search
+  box on narrow windows.
+- New `--example convert` for scripted/CI conversion.
+
 ## [1.0.0] - 2026-06-07
 
 First stable, publishable release: a stranger can install, run, understand and

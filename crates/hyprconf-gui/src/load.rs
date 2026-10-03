@@ -10,8 +10,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use hyprconf_core::lua::LuaWarning;
-use hyprconf_core::{conf, lua, ConfBundle, Config, ConfigFormat, Schema, Value};
+use hyprconf_core::{
+    conf, lua, ConfBundle, ConfWarning, Config, ConfigFormat, LuaWarning, Schema, Severity, Value,
+};
 
 use crate::edit::FieldId;
 
@@ -24,6 +25,23 @@ pub enum Origin {
     /// Parsed from `.lua` file(s). Lua always regenerates on save, so the bundle
     /// is not retained.
     Lua,
+}
+
+/// A human-friendly issue surfaced while reading the configuration.
+///
+/// Parsing never fails on these — the offending text is always preserved on
+/// disk — but the user should know about them, so each carries a plain-language
+/// summary, where it occurred, and a hint on what (if anything) to do.
+#[derive(Debug, Clone)]
+pub struct Diagnostic {
+    /// How serious it is (load-time issues are always [`Severity::Warning`]).
+    pub severity: Severity,
+    /// A one-line, plain-language description of what happened.
+    pub message: String,
+    /// Where in the source it occurred (`file:line`), when known.
+    pub location: Option<String>,
+    /// A short suggestion for how to resolve or interpret it.
+    pub hint: Option<String>,
 }
 
 /// The result of attempting to load a configuration.
@@ -67,8 +85,10 @@ pub struct Loaded {
     pub source: PathBuf,
     /// How many additional files were pulled in via includes.
     pub included_files: usize,
-    /// The number of warnings emitted while mapping the file onto the schema.
-    pub warnings: usize,
+    /// Issues found while mapping the file(s) onto the schema (unknown options,
+    /// unparseable values, preserved dynamic regions, …). Each is non-fatal and
+    /// retained in full so the UI can explain it and suggest a fix.
+    pub diagnostics: Vec<Diagnostic>,
     /// The current (possibly edited) configuration.
     pub config: Config,
     /// The effective value of each schema option at load time, used to decide
@@ -98,7 +118,7 @@ impl Loaded {
         source: PathBuf,
         included_files: usize,
         config: Config,
-        warnings: usize,
+        diagnostics: Vec<Diagnostic>,
         dynamic_regions: usize,
         origin: Origin,
         schema: &Schema,
@@ -118,7 +138,7 @@ impl Loaded {
             format,
             source,
             included_files,
-            warnings,
+            diagnostics,
             config,
             baseline: Arc::new(baseline),
             dirty: HashSet::new(),
@@ -185,12 +205,13 @@ fn load_path(path: &Path, format: ConfigFormat, schema: &Schema) -> LoadState {
                     .iter()
                     .filter(|w| matches!(w, LuaWarning::DynamicRegion { .. }))
                     .count();
+                let diagnostics = warnings.iter().map(lua_diagnostic).collect();
                 LoadState::Loaded(Box::new(Loaded::new(
                     format,
                     source,
                     included,
                     config,
-                    warnings.len(),
+                    diagnostics,
                     dynamic,
                     Origin::Lua,
                     schema,
@@ -210,12 +231,13 @@ fn load_path(path: &Path, format: ConfigFormat, schema: &Schema) -> LoadState {
                     .clone()
                     .unwrap_or_else(|| path.to_path_buf());
                 let included = bundle.documents.len().saturating_sub(1);
+                let diagnostics = warnings.iter().map(conf_diagnostic).collect();
                 LoadState::Loaded(Box::new(Loaded::new(
                     format,
                     source,
                     included,
                     config,
-                    warnings.len(),
+                    diagnostics,
                     0,
                     Origin::Conf(bundle),
                     schema,
@@ -226,6 +248,128 @@ fn load_path(path: &Path, format: ConfigFormat, schema: &Schema) -> LoadState {
                 message: e.to_string(),
             },
         },
+    }
+}
+
+/// Turn a `.conf` mapping warning into a user-facing [`Diagnostic`].
+fn conf_diagnostic(warning: &ConfWarning) -> Diagnostic {
+    match warning {
+        ConfWarning::UnknownOption { path, file, line } => Diagnostic {
+            severity: Severity::Warning,
+            message: format!("“{path}” isn’t a recognized Hyprland option"),
+            location: location(file.as_deref(), *line),
+            hint: Some(
+                "Kept exactly as written. Check for a typo, or it may belong to a plugin."
+                    .to_string(),
+            ),
+        },
+        ConfWarning::UnparsableValue {
+            path,
+            value,
+            reason,
+            file,
+            line,
+        } => Diagnostic {
+            severity: Severity::Warning,
+            message: format!("Couldn’t read the value for “{path}”: “{value}”"),
+            location: location(file.as_deref(), *line),
+            hint: Some(format!("{reason}. The original text is preserved as-is.")),
+        },
+        ConfWarning::UnparsableDirective {
+            keyword,
+            args,
+            reason,
+            file,
+            line,
+        } => Diagnostic {
+            severity: Severity::Warning,
+            message: format!("Couldn’t parse this {keyword} entry: “{args}”"),
+            location: location(file.as_deref(), *line),
+            hint: Some(format!("{reason}. It’s preserved untouched.")),
+        },
+        // `ConfWarning` is `#[non_exhaustive]`; fall back to its own message.
+        other => Diagnostic {
+            severity: Severity::Warning,
+            message: other.to_string(),
+            location: None,
+            hint: None,
+        },
+    }
+}
+
+/// Turn a Lua mapping warning into a user-facing [`Diagnostic`].
+fn lua_diagnostic(warning: &LuaWarning) -> Diagnostic {
+    match warning {
+        LuaWarning::DynamicRegion { snippet } => Diagnostic {
+            severity: Severity::Warning,
+            message: format!("Dynamic Lua kept read-only: {}", truncate(snippet)),
+            location: None,
+            hint: Some(
+                "This is code (a loop, function, …) rather than a setting, so it can’t be \
+                 edited here — it’s preserved untouched. Converting to conf would drop it."
+                    .to_string(),
+            ),
+        },
+        LuaWarning::UnknownOption { path } => Diagnostic {
+            severity: Severity::Warning,
+            message: format!("“{path}” isn’t a recognized Hyprland option"),
+            location: None,
+            hint: Some("Kept as-is. Check for a typo, or it may belong to a plugin.".to_string()),
+        },
+        LuaWarning::UnparsableValue {
+            path,
+            value,
+            reason,
+        } => Diagnostic {
+            severity: Severity::Warning,
+            message: format!("Couldn’t read the value for “{path}”: “{value}”"),
+            location: None,
+            hint: Some(format!("{reason}. The original is preserved.")),
+        },
+        LuaWarning::UnparsableCall { callee, reason } => Diagnostic {
+            severity: Severity::Warning,
+            message: format!("Couldn’t interpret a {callee}(…) call"),
+            location: None,
+            hint: Some(format!("{reason}. It’s preserved untouched.")),
+        },
+        LuaWarning::UnresolvedRequire { module } => Diagnostic {
+            severity: Severity::Warning,
+            message: format!("Couldn’t resolve require(\"{module}\")"),
+            location: None,
+            hint: Some(
+                "The file wasn’t found or couldn’t be loaded, so its settings aren’t shown."
+                    .to_string(),
+            ),
+        },
+        // `LuaWarning` is `#[non_exhaustive]`; fall back to its own message.
+        other => Diagnostic {
+            severity: Severity::Warning,
+            message: other.to_string(),
+            location: None,
+            hint: None,
+        },
+    }
+}
+
+/// Format an optional `file:line` source location.
+fn location(file: Option<&Path>, line: Option<u32>) -> Option<String> {
+    match (file, line) {
+        (Some(p), Some(l)) => Some(format!("{}:{l}", p.display())),
+        (Some(p), None) => Some(p.display().to_string()),
+        (None, Some(l)) => Some(format!("line {l}")),
+        (None, None) => None,
+    }
+}
+
+/// Collapse whitespace and clip a snippet so it fits on one tidy line.
+fn truncate(snippet: &str) -> String {
+    let one_line = snippet.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() > 80 {
+        let mut clipped: String = one_line.chars().take(79).collect();
+        clipped.push('…');
+        clipped
+    } else {
+        one_line
     }
 }
 
@@ -274,7 +418,10 @@ mod tests {
         match load_config(Some(path)) {
             LoadState::Loaded(loaded) => {
                 assert_eq!(loaded.format, ConfigFormat::Conf);
-                assert_eq!(loaded.config.get("general:gaps_in"), Some(&Value::Int(7)));
+                assert_eq!(
+                    loaded.config.get("general:gaps_in"),
+                    Some(&Value::CssGap(hyprconf_core::value::CssGap::uniform(7)))
+                );
             }
             other => panic!("expected Loaded, got {other:?}"),
         }
@@ -290,7 +437,10 @@ mod tests {
         match load_config(Some(path)) {
             LoadState::Loaded(loaded) => {
                 assert_eq!(loaded.format, ConfigFormat::Lua);
-                assert_eq!(loaded.config.get("general:gaps_in"), Some(&Value::Int(9)));
+                assert_eq!(
+                    loaded.config.get("general:gaps_in"),
+                    Some(&Value::CssGap(hyprconf_core::value::CssGap::uniform(9)))
+                );
             }
             other => panic!("expected Loaded, got {other:?}"),
         }

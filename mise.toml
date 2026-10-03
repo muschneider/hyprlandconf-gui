@@ -6,3 +6,61 @@ just = "latest"
 # Default log level for local `mise run` / `just` invocations; overridable via
 # the shell environment (e.g. `RUST_LOG=debug just run`).
 RUST_LOG = "info"
+
+# The tasks below are deliberately *user*-scoped: every artefact lands under
+# $HOME via the XDG base directories, so `mise run install` never needs — and
+# never asks for — sudo. System-wide packaging lives in `packaging/` (AUR, Nix,
+# Flatpak) and is the right tool for installing into /usr.
+
+[tasks.build]
+description = "Build the release binary at target/release/hyprconf."
+dir = "{{config_root}}"
+run = "cargo build --release --locked -p hyprconf-gui"
+
+[tasks.install]
+description = "Install hyprconf for the current user (XDG paths, no sudo)."
+depends = ["build"]
+dir = "{{config_root}}"
+run = '''
+# POSIX sh on purpose: mise runs inline tasks through `sh -c`, which is dash on
+# Debian/Ubuntu. No `pipefail` (dash has no such option, and there is nothing
+# here to pipe), no bashisms.
+set -eu
+
+bin_dir="${XDG_BIN_HOME:-$HOME/.local/bin}"
+data_dir="${XDG_DATA_HOME:-$HOME/.local/share}"
+icons_dir="$data_dir/icons/hicolor"
+
+install -Dm0755 target/release/hyprconf "$bin_dir/hyprconf"
+install -Dm0644 packaging/hyprconf.desktop "$data_dir/applications/hyprconf.desktop"
+
+# `Icon=hyprconf` is a *theme lookup*, not a path: the rasters only resolve if
+# they keep their `<size>/apps/` layout inside a hicolor tree.
+install -Dm0644 assets/icons/hyprconf.svg "$icons_dir/scalable/apps/hyprconf.svg"
+rasters=0
+for png in assets/icons/hicolor/*/apps/hyprconf.png; do
+  size=$(basename "${png%/apps/hyprconf.png}")
+  install -Dm0644 "$png" "$icons_dir/$size/apps/hyprconf.png"
+  rasters=$((rasters + 1))
+done
+
+# Menus and docks read cached indexes, so a fresh install can otherwise show a
+# blank icon until the next login. Both helpers are optional — a missing one is
+# not a reason to fail an install that already succeeded.
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database -q "$data_dir/applications" || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+  gtk-update-icon-cache -qtf "$icons_dir" || true
+fi
+
+echo "installed:"
+echo "  binary   $bin_dir/hyprconf"
+echo "  desktop  $data_dir/applications/hyprconf.desktop"
+echo "  icons    $icons_dir/scalable/apps/hyprconf.svg (+ $rasters raster sizes)"
+
+case ":${PATH}:" in
+  *":$bin_dir:"*) ;;
+  *) echo "note: $bin_dir is not on \$PATH — add it to launch hyprconf from a shell." >&2 ;;
+esac
+'''
